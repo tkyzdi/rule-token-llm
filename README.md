@@ -34,8 +34,6 @@
  ┣ 📜 large_scale_inference.py   # 大模型推理引擎 (支持交互式与批量推理)
  ┣ 📜 rule_token_engine.py       # 核心模型架构 (Attention, FSQ, MoE 专家网络)
  ┣ 📜 tokenizer_utils.py         # 词表管理、切词与张量运算工具库
- ┣ 📜 distilled_vocab.json       # 核心蒸馏词表文件
- ┗ 📜 COIG-CQIA-full.jsonl       # 开源中文指令微调数据集 (示例)
 ```
 
 ---
