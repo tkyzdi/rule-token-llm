@@ -1,4 +1,4 @@
-# rule-token—llm
+# rule-token-llm
 
 本项目是一个基于从零构建的创新型大语言模型（LLM）训练与推理框架。摒弃了传统 Transformer 的部分低效设计，引入了 **Rule Token（规则令牌）**、**非欧几何球面注意力（Non-Euclidean Spherical Attention）** 以及 **自适应混合专家系统（Adaptive MoE）**，旨在探索更高效、更具解释性的高维语义空间建模方式。
 
