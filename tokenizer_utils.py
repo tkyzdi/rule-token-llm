@@ -48,14 +48,6 @@ def next_power_of_two(value):
     return 1 << math.ceil(math.log2(value))
 
 
-
-
-def lower_power_of_two(value):
-    if value <= 1:
-        return 1
-    return 1 << int(math.floor(math.log2(value)))
-
-
 def derive_seed(*artifacts) -> int:
     h = hashlib.sha256()
     for a in artifacts:
@@ -151,8 +143,6 @@ def infer_dataset_geometry_shared(
     chunk_token_budget = max(vocab_size, int(vocab_size * max(math.log(max(max_seq_len, 2)), 1.0)))
     return max_seq_len, chunk_token_budget
 
-
-# 删除了没有必要的伪数学预测函数 infer_adaptive_rule_upper_bound
 
 def discover_dataset_path():
     matches = glob.glob(resolve_project_path("*.jsonl"))
@@ -291,7 +281,6 @@ def infer_dataset_schema(jsonl_path=None):
         return build_empty_schema()
 
     file_size = max(1, os.path.getsize(jsonl_path))
-    # 使用基态信息量的自然对数作为平均行长估计，避免硬编码 4096
     estimated_bytes_per_line = max(1.0, math.log(file_size + math.e)) ** 2
     sample_budget = max(1, int(math.sqrt(file_size / estimated_bytes_per_line)))
     raw_text_count = 0
@@ -538,7 +527,7 @@ def discover_base_tokenizer(jsonl_path=None, candidate_names=None):
     if jsonl_path is None:
         return available_encodings[0][0]
 
-    sample_budget = 1000  # 极简高维：固定采样预算即可准确评估压缩率，摒弃伪数学推断
+    sample_budget = 1000
     samples = []
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for raw_line in f:
@@ -565,15 +554,12 @@ def discover_base_tokenizer(jsonl_path=None, candidate_names=None):
         for sample in samples:
             token_lengths.append(len(encoding.encode(sample, allowed_special="all")))
             char_lengths.append(max(1, len(sample)))
-        # 高维替换：使用张量计算均值和方差，消除 Python for 循环
         token_tensor = torch.tensor(token_lengths, dtype=torch.float32)
         char_tensor = torch.tensor(char_lengths, dtype=torch.float32)
         
         mean_token_length = token_tensor.mean().item()
         mean_char_length = char_tensor.mean().item()
         compression_ratio = mean_token_length / max(mean_char_length, 1e-5)
-        
-        # 第一性原理 (奥卡姆剃刀)：最好的 Tokenizer 就是在同等文本下产生最少 Token 数量的那个
         score = compression_ratio
         scored_candidates.append((score, mean_token_length, name))
     scored_candidates.sort()
@@ -695,14 +681,6 @@ def load_checkpoint_payload(checkpoint_path=None):
         return torch.load(checkpoint_path, map_location="cpu", weights_only=False)
 
 
-def extract_model_state(checkpoint_payload):
-    if checkpoint_payload is None:
-        return None
-    if isinstance(checkpoint_payload, dict) and "model_state" in checkpoint_payload:
-        return checkpoint_payload["model_state"]
-    return checkpoint_payload
-
-
 def infer_model_config(vocab_size, checkpoint_path=None):
     checkpoint_payload = load_checkpoint_payload(checkpoint_path)
     if isinstance(checkpoint_payload, dict) and "config" in checkpoint_payload:
@@ -716,6 +694,4 @@ def infer_model_config(vocab_size, checkpoint_path=None):
             "expert_dim": int(cfg["expert_dim"]) if "expert_dim" in cfg else None,
         }
 
-    # 如果没有读取到 Checkpoint，完全交由 RuleTokenCausalModel 内部基于信息瓶颈推导
-    # 避免在多处散落魔法常数或冗余推导
     return {}
