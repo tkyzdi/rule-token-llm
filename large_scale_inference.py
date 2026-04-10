@@ -1,4 +1,3 @@
-
 import glob
 import math
 import sys
@@ -166,7 +165,6 @@ def generate_tokens(
         current_rule_tensor = torch.tensor([[current_rule]], dtype=torch.long, device=device)
         runtime_pages = expert_store.build_runtime([current_rule], device=device, training=False) if expert_store is not None else None
 
-        # 构建因果推演的 Rule 引力场和 Token 发射场
         rule_logits, truth_field_state, _, past_key_values = model(
             current_input_embeds,
             target_rule_ids=current_rule_tensor,
@@ -258,7 +256,6 @@ def run_large_scale_inference():
         logger.warning("未能加载到活跃 Token 集合，推理可能会输出随机乱码！")
     else:
         logger.info(f"成功加载 {len(active_tokens)} 个活跃 Token。")
-        # 预先过滤 rule_to_tokens
         for rule_id in list(rule_to_tokens.keys()):
             valid_t = [t for t in rule_to_tokens[rule_id] if t in active_tokens]
             if valid_t:
