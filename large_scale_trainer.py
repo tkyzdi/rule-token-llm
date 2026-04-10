@@ -60,31 +60,18 @@ class AdaptiveRuleState:
     initial_num_rules: int
     warmup_optimizer_steps: int
     min_target_rules: int
-    post_adapt_rule_only_steps: int
     token_lr_scale: float
-    token_gate_entropy_ratio: float
-    token_gate_patience: int
     adapted: bool = False
     warmup_rule_usage: Optional[torch.Tensor] = None
     warmup_entropy: Optional[List[float]] = None
     total_warmup_tokens: int = 0
     target_num_rules: Optional[int] = None
-    post_adapt_rule_only_until_update: int = 0
-    token_phase_enabled: bool = False
-    post_adapt_rule_history: Optional[List[float]] = None
-    token_update_interval: int = 4
-    token_revert_entropy_ratio: float = 0.92
-    token_revert_patience: int = 2
-    token_cooldown_steps: int = 4
-    next_token_update_step: int = 0
 
     def ensure_buffers(self, num_rules: int):
         if self.warmup_rule_usage is None or self.warmup_rule_usage.numel() != num_rules:
             self.warmup_rule_usage = torch.zeros(num_rules, dtype=torch.long)
         if self.warmup_entropy is None:
             self.warmup_entropy = []
-        if self.post_adapt_rule_history is None:
-            self.post_adapt_rule_history = []
 
 
 @dataclass
@@ -443,43 +430,21 @@ def infer_adaptive_state(
 ) -> Tuple[AdaptiveRuleState, int]:
     tokens_per_opt_step = batch_size * train_suffix_len * accumulation_steps
     saved_state = checkpoint_payload.get("adaptive_rule_state", {}) if isinstance(checkpoint_payload, dict) else {}
-    saved_token_lr_scale = float(saved_state.get("token_lr_scale", 0.15)) if saved_state else 0.15
-    saved_post_adapt_steps = int(saved_state.get("post_adapt_rule_only_steps", 0)) if saved_state else 0
-    saved_gate_ratio = float(saved_state.get("token_gate_entropy_ratio", 0.86)) if saved_state else 0.86
-    saved_gate_patience = int(saved_state.get("token_gate_patience", 2)) if saved_state else 2
-    default_token_interval = max(3, min(6, int(math.ceil(math.log2(max(configured_num_rules, 2) + 1) / 2))))
-    saved_token_interval = int(saved_state.get("token_update_interval", default_token_interval)) if saved_state else default_token_interval
-    saved_revert_ratio = float(saved_state.get("token_revert_entropy_ratio", min(0.96, saved_gate_ratio + 0.06))) if saved_state else min(0.96, saved_gate_ratio + 0.06)
-    saved_revert_patience = int(saved_state.get("token_revert_patience", max(2, saved_gate_patience))) if saved_state else max(2, saved_gate_patience)
-    saved_token_cooldown = int(saved_state.get("token_cooldown_steps", max(saved_post_adapt_steps, saved_token_interval))) if saved_state else max(saved_post_adapt_steps, saved_token_interval)
-    saved_token_phase_enabled = bool(saved_state.get("token_phase_enabled", True)) if saved_state else True
     if isinstance(checkpoint_payload, dict) and saved_state.get("adapted", False):
-        resumed_rule_only_until = 0 if saved_token_phase_enabled else max(1, saved_token_cooldown)
         final_rules = int(saved_state.get("target_num_rules", configured_num_rules))
+        saved_token_lr_scale = float(saved_state.get("token_lr_scale", 0.15))
         state = AdaptiveRuleState(
             enabled=False,
             initial_num_rules=final_rules,
             warmup_optimizer_steps=0,
             min_target_rules=max(32, min(final_rules, 128)),
-            post_adapt_rule_only_steps=max(0, saved_post_adapt_steps),
             token_lr_scale=saved_token_lr_scale,
-            token_gate_entropy_ratio=saved_gate_ratio,
-            token_gate_patience=max(1, saved_gate_patience),
             adapted=True,
             target_num_rules=final_rules,
-            post_adapt_rule_only_until_update=resumed_rule_only_until,
-            token_phase_enabled=saved_token_phase_enabled,
-            post_adapt_rule_history=list(saved_state.get("post_adapt_rule_history", [])),
-            token_update_interval=max(1, saved_token_interval),
-            token_revert_entropy_ratio=saved_revert_ratio,
-            token_revert_patience=max(1, saved_revert_patience),
-            token_cooldown_steps=max(1, saved_token_cooldown),
-            next_token_update_step=(max(1, saved_token_interval) if saved_token_phase_enabled else resumed_rule_only_until + max(1, saved_token_interval)),
         )
         state.ensure_buffers(final_rules)
         return state, final_rules
 
-    # 使用第一性原理重新推导初始规则数
     base_entropy = math.log2(max(vocab_size, 2))
     embed_size_raw = base_entropy * base_entropy
     embed_size = next_power_of_two(int(embed_size_raw))
@@ -494,21 +459,12 @@ def infer_adaptive_state(
         minimum=32,
         maximum=adaptive_upper,
     )
-    post_adapt_rule_only_steps = max(2, min(6, int(math.ceil(math.log2(adaptive_upper + 1)) / 2)))
-    token_update_interval = max(3, min(6, int(math.ceil(math.log2(adaptive_upper + 1) / 2))))
     state = AdaptiveRuleState(
         enabled=True,
         initial_num_rules=adaptive_upper,
         warmup_optimizer_steps=warmup_optimizer_steps,
         min_target_rules=min_target_rules,
-        post_adapt_rule_only_steps=post_adapt_rule_only_steps,
         token_lr_scale=0.15,
-        token_gate_entropy_ratio=0.86,
-        token_gate_patience=2,
-        token_update_interval=token_update_interval,
-        token_revert_entropy_ratio=0.92,
-        token_revert_patience=2,
-        token_cooldown_steps=max(post_adapt_rule_only_steps, token_update_interval),
     )
     return state, adaptive_upper
 
@@ -807,7 +763,6 @@ def maybe_adapt_num_rules(
         vocab_size=vocab_size,
         device=device,
     )
-    adaptive_state.post_adapt_rule_only_until_update = update_step + adaptive_state.post_adapt_rule_only_steps
     optimizer_rule, optimizer_token, optimizer_expert = rebuild_optimizers(
         new_model,
         cpu_token_embedding,
@@ -855,8 +810,7 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
 
     estimated_seq_len = max(stage.estimated_seq_len for stage in training_stages)
     bootstrap_config = infer_model_config(vocab["vocab_size"], checkpoint_path)
-    
-    # 填充由第一性原理推导的配置，避免 KeyError
+
     if not bootstrap_config:
         base_entropy = math.log2(max(vocab["vocab_size"], 2))
         embed_size = next_power_of_two(int(base_entropy * base_entropy))
@@ -1189,7 +1143,7 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                     flat_valid = valid_mask.reshape(-1)
 
                     loss_boundary = (loss_rule_boundary_flat * flat_valid).sum() / valid_sum
-                    loss_boundary += homo_grav_loss * 0.1  # 引入 0.1 权重的同态引力场正则化
+                    loss_boundary += homo_grav_loss * 0.1
                     loss_readout = (loss_local_readout_flat * flat_valid).sum() / valid_sum
                     _lb = loss_boundary.detach().item()
                     if math.isfinite(_lb):
@@ -1200,19 +1154,14 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                     kl_divergence = math.log(model.num_rules) - macro_entropy
                     beta = (loss_boundary.detach().item() + loss_readout.detach().item()) / max(math.log(model.num_rules), 1.0)
 
-                    # 纯高维逻辑空间的“降维打击”训练（解耦双阶段训练）
-                    # 交替进行高维 Rule 逻辑推演和低维 Token 发射，大幅降低显存和复杂度
-                    # 使用基于黄金分割率 (Golden Ratio) 的自适应相位波函数
                     phi = (1.0 + math.sqrt(5.0)) / 2.0
                     phase_interval = max(4, int(math.log(model.num_rules) * phi))
                     current_phase = "rule_logic" if (global_update_step // phase_interval) % 2 == 0 else "token_emission"
 
                     if current_phase == "rule_logic":
-                        # 锁定高维到低维投影，只训练高维打腹稿
                         prediction_loss = loss_boundary
                         loss = (prediction_loss + beta * kl_divergence) / accumulation_steps
                     else:
-                        # 锁定高维逻辑链，只训练具体 Token 翻译
                         prediction_loss = loss_readout
                         loss = prediction_loss / accumulation_steps
 
@@ -1426,18 +1375,7 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
             "initial_num_rules": adaptive_state.initial_num_rules,
             "warmup_optimizer_steps": adaptive_state.warmup_optimizer_steps,
             "min_target_rules": adaptive_state.min_target_rules,
-            "post_adapt_rule_only_steps": adaptive_state.post_adapt_rule_only_steps,
-            "post_adapt_rule_only_until_update": adaptive_state.post_adapt_rule_only_until_update,
             "token_lr_scale": adaptive_state.token_lr_scale,
-            "token_gate_entropy_ratio": adaptive_state.token_gate_entropy_ratio,
-            "token_gate_patience": adaptive_state.token_gate_patience,
-            "token_update_interval": adaptive_state.token_update_interval,
-            "token_revert_entropy_ratio": adaptive_state.token_revert_entropy_ratio,
-            "token_revert_patience": adaptive_state.token_revert_patience,
-            "token_cooldown_steps": adaptive_state.token_cooldown_steps,
-            "next_token_update_step": adaptive_state.next_token_update_step,
-            "token_phase_enabled": adaptive_state.token_phase_enabled,
-            "post_adapt_rule_history": adaptive_state.post_adapt_rule_history[-8:] if adaptive_state.post_adapt_rule_history else [],
             "adapted": adaptive_state.adapted,
             "target_num_rules": adaptive_state.target_num_rules if adaptive_state.target_num_rules is not None else model.num_rules,
             "total_warmup_tokens": adaptive_state.total_warmup_tokens,
