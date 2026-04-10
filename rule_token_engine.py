@@ -1,6 +1,5 @@
-
 import math
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import Dict, List, NamedTuple, Tuple
 
 import torch
 import torch.nn as nn
@@ -51,7 +50,6 @@ class FiniteScalarQuantizer(nn.Module):
     def __init__(self, levels=None, embedding_dim=256):
         super().__init__()
         if levels is None:
-            # 使用基于信息容量的最佳分配
             d = max(3, int(math.ceil(math.log(embedding_dim + 1) / math.log(6))))
             levels = self._greedy_factorize(max(2, int(math.sqrt(embedding_dim) * math.log(embedding_dim + 1))), d)
         self.levels = levels
@@ -227,7 +225,7 @@ class CausalSelfAttention(nn.Module):
             q, k, v,
             attn_mask=rule_mask,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=is_causal if rule_mask is None else False, # 如果传入自定义 mask，则在外部结合 causal mask
+            is_causal=is_causal if rule_mask is None else False,
         )
 
     def _rule_causal_attention(self, x, target_rule_ids, start_pos, sort_ctx=None):
@@ -248,27 +246,16 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rope(q, k, start_pos, rope_base=self.rope_base)
 
-        # 高维创新：非欧几里得的 Rule 路由引力场 (Non-Euclidean Spherical Attention)
-        # 真理是方向性的，不是数值大小。废弃无界的点乘，改为超球面上的余弦引力。
-        rq = self.rule_router_q[target_rule_ids] # [B, Seq, rank]
-        rk = self.rule_router_k[target_rule_ids] # [B, Seq, rank]
-        
-        # 投影到 L2 超球面
+        rq = self.rule_router_q[target_rule_ids]  # [B, Seq, rank]
+        rk = self.rule_router_k[target_rule_ids]  # [B, Seq, rank]
         rq_norm = F.normalize(rq, p=2, dim=-1)
         rk_norm = F.normalize(rk, p=2, dim=-1)
-        
-        # 计算方向性引力，并使用第一性原理推导的容量温度系数
-        # tau 随着维度增高而自然衰减，防止高维空间内积坍缩 (Curse of Dimensionality)
         tau = 1.0 / math.log(max(math.e, self.router_rank))
-        rule_affinity = torch.matmul(rq_norm, rk_norm.transpose(-1, -2)) / tau # [B, Seq, Seq]
-        
+        rule_affinity = torch.matmul(rq_norm, rk_norm.transpose(-1, -2)) / tau  # [B, Seq, Seq]
+
         causal_mask = torch.tril(torch.ones(Seq, Seq, device=q.device, dtype=torch.bool))
-        
-        # 第一性原理：未来不可测。为保证因果性，非因果区域的引力设为极小值，避免其干扰 top-k 的选择
         masked_affinity = rule_affinity.masked_fill(~causal_mask.unsqueeze(0), float('-inf'))
-        
-        # 提取 top-k 最强依存关系进行稀疏化
-        # 稀疏度动态由当前序列的信息熵（长度的平方根）决定
+
         top_k = max(2, int(math.sqrt(Seq)))
         if Seq > top_k:
             threshold = torch.topk(masked_affinity, top_k, dim=-1).values[..., -1:]
