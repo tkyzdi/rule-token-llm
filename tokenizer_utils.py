@@ -14,6 +14,7 @@ import torch
 
 
 _logger = logging.getLogger("hrsp")
+TAG_PATTERN = re.compile(r"<(/?)([A-Za-z0-9_:\-]+)>")
 
 
 def setup_logging(level=None):
@@ -513,9 +514,20 @@ def normalize_schema_messages(data, schema):
     return []
 
 
-def discover_base_tokenizer(jsonl_path=None, candidate_names=None):
+def compute_file_sha256(file_path: str, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def discover_base_tokenizer(jsonl_path=None):
     jsonl_path = jsonl_path or discover_dataset_path()
-    candidate_names = candidate_names or ("o200k_base", "cl100k_base", "p50k_base", "r50k_base", "gpt2")
+    candidate_names = ("o200k_base", "cl100k_base", "p50k_base", "r50k_base", "gpt2")
     available_encodings = []
     for name in candidate_names:
         try:
@@ -566,53 +578,263 @@ def discover_base_tokenizer(jsonl_path=None, candidate_names=None):
     return scored_candidates[0][2]
 
 
-def load_vocab_info(vocab_path=None):
-    vocab_path = vocab_path or discover_vocab_path()
-    if os.path.exists(vocab_path):
-        with open(vocab_path, "r", encoding="utf-8") as f:
-            vocab_info = json.load(f)
-        return vocab_info
+def infer_protocol_tokens(jsonl_path):
+    role_stats = {}
+    segment_stats = {}
+    content_lengths = []
+    sequence_index = 0
 
-    base_tokenizer = discover_base_tokenizer()
+    def observe_role(source_role, amount=1):
+        stats = role_stats.setdefault(source_role, {"count": 0, "position_sum": 0.0})
+        stats["count"] += amount
+        stats["position_sum"] += sequence_index
+
+    def observe_segment(source_tag, boundary, amount=1):
+        stats = segment_stats.setdefault((source_tag, boundary), {"count": 0, "position_sum": 0.0})
+        stats["count"] += amount
+        stats["position_sum"] += sequence_index
+
+    if jsonl_path is None:
+        return [
+            {"topology_class": 0, "slot": 0, "source": "__pad__", "count": 1, "symbol": "<|pad_0|>"},
+            {"topology_class": 3, "slot": 0, "source": "__eos__", "count": 1, "symbol": "<|eos_0|>"},
+        ]
+
+    schema = infer_dataset_schema(jsonl_path)
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            sample_char_len = 0
+            messages = normalize_schema_messages(data, schema)
+            for message in messages:
+                role = message.get("role", "") or "__unknown__"
+                content = message.get("content", "")
+                auxiliary_content = message.get("auxiliary_content", "")
+                observe_role(role)
+                sequence_index += 1
+                sample_char_len += len(content) + len(auxiliary_content)
+
+                for slash, tag_name in TAG_PATTERN.findall(content):
+                    observe_segment(tag_name.lower(), "close" if slash else "open")
+                    sequence_index += 1
+
+                if auxiliary_content:
+                    observe_segment("__auxiliary__", "open")
+                    sequence_index += 1
+                    observe_segment("__auxiliary__", "close")
+                    sequence_index += 1
+
+            if sample_char_len > 0:
+                content_lengths.append(sample_char_len)
+
+    role_order = sorted(
+        role_stats.items(),
+        key=lambda item: (
+            -item[1]["count"],
+            item[1]["position_sum"] / max(item[1]["count"], 1),
+            item[0],
+        ),
+    )
+    role_catalog = [
+        {
+            "topology_class": 1,
+            "slot": index,
+            "source": source_role,
+            "count": stats["count"],
+            "symbol": f"<|role_{index}|>",
+        }
+        for index, (source_role, stats) in enumerate(role_order)
+        if stats["count"] > 0
+    ]
+
+    segment_groups = {}
+    for (source_tag, boundary), stats in segment_stats.items():
+        group = segment_groups.setdefault(source_tag, {"count": 0, "position_sum": 0.0, "boundaries": {}})
+        group["count"] += stats["count"]
+        group["position_sum"] += stats["position_sum"]
+        group["boundaries"][boundary] = stats
+
+    segment_order = sorted(
+        segment_groups.items(),
+        key=lambda item: (
+            -item[1]["count"],
+            item[1]["position_sum"] / max(item[1]["count"], 1),
+            item[0],
+        ),
+    )
+    segment_catalog = []
+    for slot_index, (source_tag, group) in enumerate(segment_order):
+        for boundary in ("open", "close"):
+            stats = group["boundaries"].get(boundary)
+            if stats is None:
+                continue
+            segment_catalog.append({
+                "topology_class": 2,
+                "slot": slot_index,
+                "boundary": boundary,
+                "source": source_tag,
+                "count": stats["count"],
+                "symbol": f"<|segment_{slot_index}_{boundary}|>",
+            })
+
+    if content_lengths:
+        content_tensor = torch.tensor(content_lengths, dtype=torch.float32)
+        variance = content_tensor.var(unbiased=False).item()
+        pad_count = max(1, int(math.sqrt(math.sqrt(variance))))
+    else:
+        pad_count = 1
+
+    eos_count = max(1, sum(stats["count"] for stats in role_stats.values()))
+    return [
+        {"topology_class": 0, "slot": 0, "source": "__pad__", "count": pad_count, "symbol": "<|pad_0|>"},
+        *role_catalog,
+        *segment_catalog,
+        {"topology_class": 3, "slot": 0, "source": "__eos__", "count": eos_count, "symbol": "<|eos_0|>"},
+    ]
+
+
+def iter_training_texts(jsonl_path):
+    if jsonl_path is None or not os.path.exists(jsonl_path):
+        return
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        for raw_line in f:
+            line = raw_line.strip()
+            if not line:
+                continue
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError:
+                text = line
+            else:
+                text = extract_record_text(data) if isinstance(data, dict) else data if isinstance(data, str) else ""
+            if isinstance(text, str) and text.strip():
+                yield text
+
+
+def build_dataset_vocab_info(jsonl_path=None):
+    jsonl_path = jsonl_path or discover_dataset_path()
+    if jsonl_path is None:
+        raise FileNotFoundError("未发现可用的 JSONL 数据集，无法构建训练数据词表。")
+
+    base_tokenizer = discover_base_tokenizer(jsonl_path)
     base_enc = tiktoken.get_encoding(base_tokenizer)
-    dataset_chunk_paths = glob.glob(resolve_project_path("*_dataset_chunk_*.pt"))
-    observed_max_token_id = len(base_enc._mergeable_ranks) - 1
-    for chunk_path in dataset_chunk_paths[: min(len(dataset_chunk_paths), 8)]:
-        chunk_data = torch.load(chunk_path, map_location="cpu")
-        for item in chunk_data[: min(len(chunk_data), 128)]:
-            sequence = item.get("sequence", [])
-            if isinstance(sequence, torch.Tensor):
-                if sequence.numel() > 0:
-                    observed_max_token_id = max(observed_max_token_id, int(sequence.max().item()))
-            elif sequence:
-                observed_max_token_id = max(observed_max_token_id, int(max(sequence)))
+    observed_base_token_ids = set()
+    for text in iter_training_texts(jsonl_path):
+        observed_base_token_ids.update(base_enc.encode(text, allowed_special=set()))
 
-    pad_id = observed_max_token_id + 1
-    eos_id = observed_max_token_id + 2
+    observed_base_token_ids = sorted(int(token_id) for token_id in observed_base_token_ids)
+    protocol_catalog = infer_protocol_tokens(jsonl_path)
+    normal_vocab_size = len(observed_base_token_ids)
+    special_tokens = {
+        entry["symbol"]: normal_vocab_size + offset
+        for offset, entry in enumerate(protocol_catalog)
+    }
     return {
+        "vocab_size": normal_vocab_size + len(special_tokens),
+        "normal_vocab_size": normal_vocab_size,
+        "observed_base_token_ids": observed_base_token_ids,
+        "special_tokens": special_tokens,
         "base_tokenizer": base_tokenizer,
-        "vocab_size": eos_id + 1,
-        "special_tokens": {
-            "<PAD>": pad_id,
-            "<EOS>": eos_id,
-        },
-        "protocol_catalog": [
-            {"symbol": "<PAD>", "topology_class": 0, "count": 0, "slot": 0, "source": "fallback", "boundary": "left"},
-            {"symbol": "<EOS>", "topology_class": 3, "count": 0, "slot": 0, "source": "fallback", "boundary": "right"},
-        ],
+        "protocol_catalog": protocol_catalog,
+        "_source_hash": compute_file_sha256(jsonl_path),
     }
 
 
-def get_custom_tokenizer(vocab_path=None):
-    vocab_info = load_vocab_info(vocab_path)
-    base_enc = tiktoken.get_encoding(vocab_info.get("base_tokenizer", discover_base_tokenizer()))
+def write_vocab_info(vocab_path=None, jsonl_path=None):
+    vocab_path = vocab_path or discover_vocab_path()
+    vocab_info = build_dataset_vocab_info(jsonl_path=jsonl_path)
+    with open(vocab_path, "w", encoding="utf-8") as f:
+        json.dump(vocab_info, f, ensure_ascii=False)
+    return vocab_info
+
+
+class DatasetBoundTokenizer:
+    def __init__(self, vocab_info):
+        self.vocab_info = vocab_info
+        self.base_enc = tiktoken.get_encoding(vocab_info["base_tokenizer"])
+        observed_ids = vocab_info["observed_base_token_ids"]
+        self.local_to_base = [int(token_id) for token_id in observed_ids]
+        self.base_to_local = {base_id: local_id for local_id, base_id in enumerate(self.local_to_base)}
+        self.normal_vocab_size = len(self.local_to_base)
+        self.special_tokens = {str(k): int(v) for k, v in vocab_info["special_tokens"].items()}
+        self.special_tokens_inv = {token_id: symbol for symbol, token_id in self.special_tokens.items()}
+        special_symbols = sorted(self.special_tokens.keys(), key=len, reverse=True)
+        self._special_pattern = re.compile("|".join(map(re.escape, special_symbols))) if special_symbols else None
+
+    def _encode_plain_text(self, text: str) -> List[int]:
+        if not text:
+            return []
+        base_ids = self.base_enc.encode(text, allowed_special=set())
+        return [self.base_to_local[token_id] for token_id in base_ids if token_id in self.base_to_local]
+
+    def encode(self, text: str, allowed_special="all") -> List[int]:
+        if not text:
+            return []
+        if allowed_special == "all":
+            allowed_symbols = set(self.special_tokens.keys())
+        elif isinstance(allowed_special, (set, list, tuple)):
+            allowed_symbols = {str(symbol) for symbol in allowed_special}
+        else:
+            allowed_symbols = set()
+
+        if not allowed_symbols or self._special_pattern is None:
+            return self._encode_plain_text(text)
+
+        token_ids = []
+        cursor = 0
+        for match in self._special_pattern.finditer(text):
+            symbol = match.group(0)
+            if symbol not in allowed_symbols:
+                continue
+            if match.start() > cursor:
+                token_ids.extend(self._encode_plain_text(text[cursor:match.start()]))
+            token_ids.append(self.special_tokens[symbol])
+            cursor = match.end()
+        if cursor < len(text):
+            token_ids.extend(self._encode_plain_text(text[cursor:]))
+        return token_ids
+
+    def decode(self, token_ids, errors="replace") -> str:
+        parts = []
+        normal_base_ids = []
+        for token_id in token_ids:
+            token_id = int(token_id)
+            if token_id in self.special_tokens_inv:
+                if normal_base_ids:
+                    parts.append(self.base_enc.decode(normal_base_ids, errors=errors))
+                    normal_base_ids = []
+                parts.append(self.special_tokens_inv[token_id])
+            elif 0 <= token_id < self.normal_vocab_size:
+                normal_base_ids.append(self.local_to_base[token_id])
+        if normal_base_ids:
+            parts.append(self.base_enc.decode(normal_base_ids, errors=errors))
+        return "".join(parts)
+
+    def is_normal_token_id(self, token_id: int) -> bool:
+        token_id = int(token_id)
+        return 0 <= token_id < self.normal_vocab_size
+
+
+def load_vocab_info():
+    vocab_path = discover_vocab_path()
+    if os.path.exists(vocab_path):
+        with open(vocab_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return write_vocab_info(vocab_path=vocab_path)
+
+
+def get_custom_tokenizer():
+    vocab_info = load_vocab_info()
     special_tokens = {k: int(v) for k, v in vocab_info.get("special_tokens", {}).items()}
-    enc = tiktoken.Encoding(
-        name=f"custom_{vocab_info.get('base_tokenizer', base_enc.name)}",
-        pat_str=base_enc._pat_str,
-        mergeable_ranks=base_enc._mergeable_ranks,
-        special_tokens={**base_enc._special_tokens, **special_tokens}
-    )
+    enc = DatasetBoundTokenizer(vocab_info)
     return enc, special_tokens
 
 
@@ -652,16 +874,6 @@ def resolve_protocol_tokens(vocab_info):
             slot_bucket[payload["boundary"]] = payload
 
     protocol["role_slots"].sort(key=lambda item: item["slot"])
-
-    fallback_symbols = {
-        "pad": "<PAD>",
-        "eos": "<EOS>",
-    }
-    for semantic, symbol in fallback_symbols.items():
-        if symbol in special_tokens:
-            payload = {"symbol": symbol, "id": special_tokens[symbol], "count": 0}
-            if semantic in {"pad", "eos"} and semantic not in protocol:
-                protocol[semantic] = payload
     return protocol
 
 
