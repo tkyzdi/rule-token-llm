@@ -67,7 +67,6 @@ def decode_sequence(enc, special_tokens_inv, protocol_tokens, token_ids):
     for role_payload in protocol_tokens["role_slots"]:
         format_symbols.add(role_payload["symbol"])
     format_symbols.add(protocol_tokens["eos"]["symbol"])
-    valid_normal_ids = set(enc._mergeable_ranks.values()).union(set(enc._special_tokens.values()))
     for token_id in token_ids:
         if token_id in special_tokens_inv:
             if normal_ids:
@@ -80,7 +79,7 @@ def decode_sequence(enc, special_tokens_inv, protocol_tokens, token_ids):
                 else:
                     parts.append(symbol)
         else:
-            if token_id in valid_normal_ids:
+            if enc.is_normal_token_id(token_id):
                 normal_ids.append(token_id)
     if normal_ids:
         parts.append(enc.decode(normal_ids, errors="replace"))
