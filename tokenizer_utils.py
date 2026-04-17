@@ -1,3 +1,4 @@
+import bisect
 import glob
 import hashlib
 import json
@@ -7,6 +8,7 @@ import os
 import random
 import re
 import tempfile
+import unicodedata
 from typing import Callable, List, Optional
 
 import tiktoken
@@ -15,6 +17,8 @@ import torch
 
 _logger = logging.getLogger("hrsp")
 TAG_PATTERN = re.compile(r"<(/?)([A-Za-z0-9_:\-]+)>")
+INLINE_WHITESPACE_PATTERN = re.compile(r"[^\S\n]+")
+EXCESS_NEWLINE_PATTERN = re.compile(r"\n{3,}")
 
 
 def setup_logging(level=None):
@@ -33,6 +37,56 @@ def get_logger():
     if not _logger.handlers:
         setup_logging()
     return _logger
+
+
+def _update_removed_category(stats: Optional[dict], category: str):
+    if stats is None:
+        return
+    removed_categories = stats.setdefault("removed_categories", {})
+    removed_categories[category] = int(removed_categories.get(category, 0)) + 1
+
+
+def sanitize_training_text(text: str, stats: Optional[dict] = None) -> str:
+    if not isinstance(text, str):
+        return ""
+    if stats is not None:
+        stats["input_records"] = int(stats.get("input_records", 0)) + 1
+        stats["input_chars"] = int(stats.get("input_chars", 0)) + len(text)
+
+    normalized = unicodedata.normalize("NFKC", text).replace("\r\n", "\n").replace("\r", "\n")
+    sanitized_chars = []
+    removed_chars = 0
+    for ch in normalized:
+        if ch == "\n":
+            sanitized_chars.append(ch)
+            continue
+        if ch in {"\t", "\v", "\f"}:
+            sanitized_chars.append(" ")
+            continue
+        category = unicodedata.category(ch)
+        if ch == "\ufffd":
+            removed_chars += 1
+            _update_removed_category(stats, "REPLACEMENT_CHARACTER")
+            continue
+        if category.startswith("C"):
+            removed_chars += 1
+            _update_removed_category(stats, category)
+            continue
+        sanitized_chars.append(ch)
+
+    cleaned = "".join(sanitized_chars)
+    cleaned = INLINE_WHITESPACE_PATTERN.sub(" ", cleaned)
+    cleaned = re.sub(r" *\n *", "\n", cleaned)
+    cleaned = EXCESS_NEWLINE_PATTERN.sub("\n\n", cleaned).strip()
+
+    if stats is not None:
+        stats["removed_chars"] = int(stats.get("removed_chars", 0)) + removed_chars
+        stats["output_chars"] = int(stats.get("output_chars", 0)) + len(cleaned)
+        if cleaned:
+            stats["retained_records"] = int(stats.get("retained_records", 0)) + 1
+        else:
+            stats["dropped_records"] = int(stats.get("dropped_records", 0)) + 1
+    return cleaned
 
 
 def get_project_dir():
@@ -284,13 +338,11 @@ def infer_dataset_schema(jsonl_path=None):
     file_size = max(1, os.path.getsize(jsonl_path))
     estimated_bytes_per_line = max(1.0, math.log(file_size + math.e)) ** 2
     sample_budget = max(1, int(math.sqrt(file_size / estimated_bytes_per_line)))
-    raw_text_count = 0
     record_field_stats = {}
     container_stats = {}
 
     for record in iter_dataset_records(jsonl_path, sample_budget=sample_budget):
         if isinstance(record, str):
-            raw_text_count += 1
             continue
         if not isinstance(record, dict):
             continue
@@ -381,7 +433,7 @@ def infer_dataset_schema(jsonl_path=None):
     return schema
 
 
-def extract_record_text(data):
+def compose_record_text(data):
     schema = infer_record_schema(data)
     if schema["mode"] == "raw_text":
         return data if isinstance(data, str) else ""
@@ -394,6 +446,10 @@ def extract_record_text(data):
                 segments.append(message["auxiliary_content"])
         return "\n".join(segments)
     return "\n".join(part for part in extract_schema_record_parts(data, schema) if part)
+
+
+def extract_record_text(data):
+    return sanitize_training_text(compose_record_text(data))
 
 
 def infer_record_schema(data):
@@ -584,14 +640,14 @@ def infer_protocol_tokens(jsonl_path):
     content_lengths = []
     sequence_index = 0
 
-    def observe_role(source_role, amount=1):
+    def observe_role(source_role):
         stats = role_stats.setdefault(source_role, {"count": 0, "position_sum": 0.0})
-        stats["count"] += amount
+        stats["count"] += 1
         stats["position_sum"] += sequence_index
 
-    def observe_segment(source_tag, boundary, amount=1):
+    def observe_segment(source_tag, boundary):
         stats = segment_stats.setdefault((source_tag, boundary), {"count": 0, "position_sum": 0.0})
-        stats["count"] += amount
+        stats["count"] += 1
         stats["position_sum"] += sequence_index
 
     if jsonl_path is None:
@@ -701,7 +757,7 @@ def infer_protocol_tokens(jsonl_path):
     ]
 
 
-def iter_training_texts(jsonl_path):
+def iter_training_texts(jsonl_path, stats: Optional[dict] = None):
     if jsonl_path is None or not os.path.exists(jsonl_path):
         return
     with open(jsonl_path, "r", encoding="utf-8") as f:
@@ -714,9 +770,10 @@ def iter_training_texts(jsonl_path):
             except json.JSONDecodeError:
                 text = line
             else:
-                text = extract_record_text(data) if isinstance(data, dict) else data if isinstance(data, str) else ""
-            if isinstance(text, str) and text.strip():
-                yield text
+                text = compose_record_text(data) if isinstance(data, (dict, str)) else ""
+            cleaned = sanitize_training_text(text, stats=stats)
+            if cleaned:
+                yield cleaned
 
 
 def build_dataset_vocab_info(jsonl_path=None):
@@ -727,7 +784,8 @@ def build_dataset_vocab_info(jsonl_path=None):
     base_tokenizer = discover_base_tokenizer(jsonl_path)
     base_enc = tiktoken.get_encoding(base_tokenizer)
     observed_base_token_ids = set()
-    for text in iter_training_texts(jsonl_path):
+    sanitation_stats = {}
+    for text in iter_training_texts(jsonl_path, stats=sanitation_stats):
         observed_base_token_ids.update(base_enc.encode(text, allowed_special=set()))
 
     observed_base_token_ids = sorted(int(token_id) for token_id in observed_base_token_ids)
@@ -744,6 +802,7 @@ def build_dataset_vocab_info(jsonl_path=None):
         "special_tokens": special_tokens,
         "base_tokenizer": base_tokenizer,
         "protocol_catalog": protocol_catalog,
+        "sanitization_stats": sanitation_stats,
         "_source_hash": compute_file_sha256(jsonl_path),
     }
 
@@ -773,7 +832,27 @@ class DatasetBoundTokenizer:
         if not text:
             return []
         base_ids = self.base_enc.encode(text, allowed_special=set())
-        return [self.base_to_local[token_id] for token_id in base_ids if token_id in self.base_to_local]
+        # OOV handling: instead of silently dropping unseen base tokens (which
+        # erases parts of the user input during inference), map each OOV id to
+        # the nearest observed base id in lexicographic distance.  This is
+        # deterministic and requires no special <unk> slot.
+        result: List[int] = []
+        for token_id in base_ids:
+            local = self.base_to_local.get(token_id)
+            if local is not None:
+                result.append(local)
+                continue
+            # Binary-search nearest neighbour in the sorted observed-id table.
+            idx = bisect.bisect_left(self.local_to_base, token_id)
+            candidates = []
+            if idx < len(self.local_to_base):
+                candidates.append((abs(self.local_to_base[idx] - token_id), idx))
+            if idx > 0:
+                candidates.append((abs(self.local_to_base[idx - 1] - token_id), idx - 1))
+            if candidates:
+                _, nearest_local = min(candidates)
+                result.append(nearest_local)
+        return result
 
     def encode(self, text: str, allowed_special="all") -> List[int]:
         if not text:
@@ -802,20 +881,20 @@ class DatasetBoundTokenizer:
             token_ids.extend(self._encode_plain_text(text[cursor:]))
         return token_ids
 
-    def decode(self, token_ids, errors="replace") -> str:
+    def decode(self, token_ids) -> str:
         parts = []
         normal_base_ids = []
         for token_id in token_ids:
             token_id = int(token_id)
             if token_id in self.special_tokens_inv:
                 if normal_base_ids:
-                    parts.append(self.base_enc.decode(normal_base_ids, errors=errors))
+                    parts.append(self.base_enc.decode(normal_base_ids, errors="replace"))
                     normal_base_ids = []
                 parts.append(self.special_tokens_inv[token_id])
             elif 0 <= token_id < self.normal_vocab_size:
                 normal_base_ids.append(self.local_to_base[token_id])
         if normal_base_ids:
-            parts.append(self.base_enc.decode(normal_base_ids, errors=errors))
+            parts.append(self.base_enc.decode(normal_base_ids, errors="replace"))
         return "".join(parts)
 
     def is_normal_token_id(self, token_id: int) -> bool:
@@ -907,3 +986,4 @@ def infer_model_config(vocab_size, checkpoint_path=None):
         }
 
     return {}
+
