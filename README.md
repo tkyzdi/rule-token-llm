@@ -8,19 +8,21 @@
 
 ## 🌟 核心创新特性
 
-1. **Rule Token Causal Model (规则令牌因果模型)**
-   - 彻底重构了 Token 映射机制，使用连续的“规则”引导生成，取代传统离散的 Token 预测。
-   - 结合有限标量量化（FSQ, Finite Scalar Quantizer）技术，实现语义空间的自适应切分。
+1. **Rule Token Causal Model (内生规则区域因果模型)**
+   - 彻底重构了 Token 映射机制，采用**内生规则区域范式 (Endogenous Rule-Region Paradigm)**，将高维词表空间划分为基于高斯分布的“规则流形”。
+   - 推理成为两步层级计算：1. 宏观路由定位规则区域；2. 微观坍缩定位具体 Token。摒弃外部硬编码映射，拥抱连续空间内的引力路由。
+   - **完全连续自回归生成 (Continuous Auto-Regressive Generation)**：模型具备自主预测 `<EOS>` 终止的能力，彻底消除硬编码长度限制和人为标点符号干预。
 
-2. **Non-Euclidean Spherical Attention (非欧球面注意力机制)**
-   - 废弃了传统无界的点乘注意力（Dot-product Attention），采用 L2 超球面上的余弦引力（Cosine Gravity）。
-   - 真理是方向性的，而非数值大小。这有效防止了高维空间内的内积坍缩（Curse of Dimensionality），并在稀疏化掩码下保证严格的因果律。
+2. **Non-Euclidean Spherical Attention & Top-Down Masking (非欧球面注意力与自顶向下掩码)**
+   - 废弃了传统无界的点乘注意力（Dot-product Attention），采用 L2 超球面上的余弦引力（Cosine Gravity）。真理是方向性的，而非数值大小。
+   - **自顶向下的注意力掩码 (Top-Down Attention Masking)**：由规则本身决定注意力拓扑结构，强制实现稀疏且结构相关的注意力，屏蔽高维噪声，显著提升梯度保真度。
 
 3. **RulePagedExpertStore (基于规则的分页专家存储 MoE)**
    - 动态计算 Rule 的使用频率，自动加载和卸载专家网络（Expert FFNs），实现极细粒度的计算资源调度。
    - 在不增加显存压力的前提下，显著提升模型参数容量。
 
-4. **自适应训练状态管理 (Adaptive Rule State)**
+4. **Fully Intelligent Driven Architecture (完全智能驱动的自适应架构)**
+   - 基于高维几何容量（$\sqrt{embed\_size}$）与当前信息熵，**智能动态调整负样本数量**（Dynamic Negative Sampling）与温度系数。
    - 根据梯度范数和信息熵动态调整学习率和规则数量，内置 Log-space EMA 梯度追踪器，防止训练过程中的“死亡螺旋”。
 
 ---
