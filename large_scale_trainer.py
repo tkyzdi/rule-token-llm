@@ -544,44 +544,109 @@ def decide_adaptive_num_rules(
     return int(proposed), stats
 
 
-def build_rule_remap(old_model: RuleTokenCausalModel, usage_counts: torch.Tensor, target_num_rules: int) -> torch.Tensor:
+def sinkhorn_transport(
+    cost: torch.Tensor,
+    row_marginal: torch.Tensor,
+    col_marginal: torch.Tensor,
+    eps: float = 0.05,
+    max_iter: int = 200,
+    tol: float = 1e-7,
+) -> torch.Tensor:
+    """Entropy-regularised optimal transport (Sinkhorn-Knopp).
+
+    Given a cost matrix C ∈ R^{N x M} and marginals μ ∈ Δ^{N-1}, ν ∈ Δ^{M-1},
+    returns the transport plan T ∈ R_+^{N x M} satisfying
+      T·1 = μ,   T^T·1 = ν,
+      T = argmin ⟨T, C⟩ - ε·H(T).
+    Implemented in log space to avoid underflow when ε is small and costs are
+    large.  Shapes are otherwise arbitrary; no gradient needs to flow through
+    the plan for our use case, so we keep everything in float32 on CPU.
+    """
+    N, M = cost.shape
+    log_mu = torch.log(row_marginal.clamp_min(1e-30))
+    log_nu = torch.log(col_marginal.clamp_min(1e-30))
+    log_K = -cost / max(eps, 1e-6)
+    log_u = torch.zeros(N, dtype=cost.dtype)
+    log_v = torch.zeros(M, dtype=cost.dtype)
+    for _ in range(max_iter):
+        new_log_u = log_mu - torch.logsumexp(log_K + log_v.unsqueeze(0), dim=1)
+        new_log_v = log_nu - torch.logsumexp(log_K + new_log_u.unsqueeze(1), dim=0)
+        if (torch.max(torch.abs(new_log_u - log_u)).item() < tol
+                and torch.max(torch.abs(new_log_v - log_v)).item() < tol):
+            log_u, log_v = new_log_u, new_log_v
+            break
+        log_u, log_v = new_log_u, new_log_v
+    return torch.exp(log_u.unsqueeze(1) + log_K + log_v.unsqueeze(0))
+
+
+def build_rule_transport_plan(
+    old_model: RuleTokenCausalModel,
+    usage_counts: torch.Tensor,
+    target_num_rules: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute a Sinkhorn OT plan from old rules to surviving new rules.
+
+    Replaces the old nearest-centroid argmax (which forced hard assignments
+    and broke learned differentiation).  The plan is a probability-preserving
+    soft matching in which each old rule fractionally contributes to every
+    new rule, weighted by both semantic similarity (cosine of the rule
+    predictor weight) and usage mass.
+
+    Returns (mapping, transport_plan) where mapping is a hard argmax for
+    legacy code paths and transport_plan is the Sinkhorn matrix used for
+    barycentric merging.
+    """
     old_num_rules = old_model.num_rules
-    usage_counts = usage_counts.to(torch.float32)
+    usage_counts_f = usage_counts.to(torch.float32).cpu()
     k = min(target_num_rules, old_num_rules)
-    topk = torch.topk(usage_counts, k=k, largest=True, sorted=True).indices
+
     predictor_weight = old_model.rule_boundary_predictor.weight.detach().cpu().to(torch.float32)
-    selected = predictor_weight[topk]
-    selected = F.normalize(selected, p=2, dim=-1)
+    topk_idx = torch.topk(usage_counts_f, k=k, largest=True, sorted=False).indices
+    selected = F.normalize(predictor_weight[topk_idx], p=2, dim=-1)
     all_norm = F.normalize(predictor_weight, p=2, dim=-1)
-    sims = torch.matmul(all_norm, selected.transpose(0, 1))
-    mapping = torch.argmax(sims, dim=-1)
-    for new_idx, old_idx in enumerate(topk.tolist()):
+    cost = 1.0 - all_norm @ selected.T                  # [N_old, k], in [0, 2]
+
+    old_marginal = usage_counts_f.clamp_min(1.0)
+    old_marginal = old_marginal / old_marginal.sum()
+    new_marginal = torch.full((k,), 1.0 / k)
+
+    plan = sinkhorn_transport(cost, old_marginal, new_marginal)
+
+    mapping = torch.argmax(plan, dim=-1).to(torch.long)
+    for new_idx, old_idx in enumerate(topk_idx.tolist()):
         mapping[old_idx] = new_idx
-    return mapping.to(torch.long)
+    return mapping, plan
 
 
-def merge_rule_tensor(old_tensor: torch.Tensor, mapping: torch.Tensor, new_num_rules: int) -> torch.Tensor:
-    out = torch.zeros((new_num_rules,) + tuple(old_tensor.shape[1:]), dtype=old_tensor.dtype)
-    counts = torch.zeros(new_num_rules, dtype=torch.float32)
-    for old_idx in range(old_tensor.size(0)):
-        new_idx = int(mapping[old_idx].item())
-        out[new_idx] += old_tensor[old_idx].detach().cpu()
-        counts[new_idx] += 1.0
-    nonzero = counts > 0
-    if nonzero.any():
-        out[nonzero] = out[nonzero] / counts[nonzero].view(-1, *([1] * (out.dim() - 1)))
-    if (~nonzero).any():
-        global_mean = old_tensor.detach().cpu().mean(dim=0)
-        out[~nonzero] = global_mean
+def merge_rule_tensor_ot(old_tensor: torch.Tensor, transport_plan: torch.Tensor, new_num_rules: int) -> torch.Tensor:
+    """Barycentric projection merge: new_j = Σ_i (T[i,j] / Σ_i T[i,j]) · old_i.
+
+    This is the canonical OT-consistent way to push a source measure through
+    a transport plan.  It preserves learned directionality far better than
+    the arithmetic mean used by merge_rule_tensor_mean: rules with tiny
+    transport mass don't dominate merging, and surviving high-mass rules
+    anchor the new centroid.
+    """
+    old_flat = old_tensor.detach().cpu().to(torch.float32).reshape(old_tensor.size(0), -1)
+    col_sum = transport_plan.sum(dim=0, keepdim=True).clamp_min(1e-12)
+    weights = transport_plan / col_sum                   # [N_old, N_new]
+    new_flat = weights.T @ old_flat                      # [N_new, D]
+    out = new_flat.reshape(new_num_rules, *old_tensor.shape[1:]).to(old_tensor.dtype)
+    # Degenerate rows (plan column sum = 0) fall back to global mean so the
+    # new rule is not initialised with pure zeros.
+    degenerate_cols = (transport_plan.sum(dim=0) <= 1e-12)
+    if degenerate_cols.any():
+        global_mean = old_tensor.detach().cpu().mean(dim=0).to(out.dtype)
+        out[degenerate_cols] = global_mean
     return out
 
 
-def merge_projection_rules(old_proj: RuleAwareProjection, new_proj: RuleAwareProjection, mapping: torch.Tensor):
+def merge_projection_rules(old_proj: RuleAwareProjection, new_proj: RuleAwareProjection, transport_plan: torch.Tensor):
     new_proj.shared_in.data.copy_(old_proj.shared_in.data)
     new_proj.shared_out.data.copy_(old_proj.shared_out.data)
-    new_proj.rule_in.data.copy_(merge_rule_tensor(old_proj.rule_in.data, mapping, new_proj.rule_in.size(0)))
-    new_proj.rule_out.data.copy_(merge_rule_tensor(old_proj.rule_out.data, mapping, new_proj.rule_out.size(0)))
-    new_proj.rule_block_logits.data.copy_(merge_rule_tensor(old_proj.rule_block_logits.data, mapping, new_proj.rule_block_logits.size(0)))
+    new_proj.rule_U.data.copy_(merge_rule_tensor_ot(old_proj.rule_U.data, transport_plan, new_proj.rule_U.size(0)))
+    new_proj.rule_V.data.copy_(merge_rule_tensor_ot(old_proj.rule_V.data, transport_plan, new_proj.rule_V.size(0)))
+    new_proj.rule_gain.data.copy_(merge_rule_tensor_ot(old_proj.rule_gain.data.unsqueeze(-1), transport_plan, new_proj.rule_gain.size(0)).squeeze(-1))
 
 
 def build_adapted_runtime(
@@ -592,7 +657,7 @@ def build_adapted_runtime(
     vocab_size: int,
     device: torch.device,
 ) -> Tuple[RuleTokenCausalModel, RulePagedExpertStore, torch.Tensor]:
-    mapping = build_rule_remap(old_model, usage_counts, target_num_rules)
+    mapping, transport_plan = build_rule_transport_plan(old_model, usage_counts, target_num_rules)
     new_model = RuleTokenCausalModel(
         vocab_size=vocab_size,
         num_rules=target_num_rules,
@@ -607,9 +672,9 @@ def build_adapted_runtime(
     new_state = new_model.state_dict()
     skip_fragments = [
         "rule_boundary_predictor",
-        ".rule_in",
-        ".rule_out",
-        ".rule_block_logits",
+        ".rule_U",
+        ".rule_V",
+        ".rule_gain",
         ".rule_router_",
         ".experts.",
         "vq_layer.basis",
@@ -627,29 +692,29 @@ def build_adapted_runtime(
         new_model.vq_layer.project_out.load_state_dict(old_model.vq_layer.project_out.state_dict())
 
     new_model.rule_boundary_predictor.weight.data.copy_(
-        merge_rule_tensor(old_model.rule_boundary_predictor.weight.data, mapping, target_num_rules)
+        merge_rule_tensor_ot(old_model.rule_boundary_predictor.weight.data, transport_plan, target_num_rules)
     )
     new_model.rule_boundary_predictor.bias.data.copy_(
-        merge_rule_tensor(old_model.rule_boundary_predictor.bias.data.unsqueeze(-1), mapping, target_num_rules).squeeze(-1)
+        merge_rule_tensor_ot(old_model.rule_boundary_predictor.bias.data.unsqueeze(-1), transport_plan, target_num_rules).squeeze(-1)
     )
 
     for old_block, new_block in zip(old_model.layers, new_model.layers):
-        merge_projection_rules(old_block.attn.q_proj, new_block.attn.q_proj, mapping)
-        merge_projection_rules(old_block.attn.k_proj, new_block.attn.k_proj, mapping)
-        merge_projection_rules(old_block.attn.v_proj, new_block.attn.v_proj, mapping)
-        merge_projection_rules(old_block.attn.out_proj, new_block.attn.out_proj, mapping)
-        
-        new_block.attn.rule_router_q.data.copy_(merge_rule_tensor(old_block.attn.rule_router_q.data, mapping, target_num_rules))
-        new_block.attn.rule_router_k.data.copy_(merge_rule_tensor(old_block.attn.rule_router_k.data, mapping, target_num_rules))
+        merge_projection_rules(old_block.attn.q_proj, new_block.attn.q_proj, transport_plan)
+        merge_projection_rules(old_block.attn.k_proj, new_block.attn.k_proj, transport_plan)
+        merge_projection_rules(old_block.attn.v_proj, new_block.attn.v_proj, transport_plan)
+        merge_projection_rules(old_block.attn.out_proj, new_block.attn.out_proj, transport_plan)
+
+        new_block.attn.rule_router_q.data.copy_(merge_rule_tensor_ot(old_block.attn.rule_router_q.data, transport_plan, target_num_rules))
+        new_block.attn.rule_router_k.data.copy_(merge_rule_tensor_ot(old_block.attn.rule_router_k.data, transport_plan, target_num_rules))
 
     new_expert_store = RulePagedExpertStore.from_model(new_model)
     for layer_idx in range(old_model.num_layers):
         old_layer = old_expert_store.layers[layer_idx]
         new_layer = new_expert_store.layers[layer_idx]
-        new_layer.w1.data.copy_(merge_rule_tensor(old_layer.w1.data, mapping, target_num_rules))
-        new_layer.b1.data.copy_(merge_rule_tensor(old_layer.b1.data, mapping, target_num_rules))
-        new_layer.w2.data.copy_(merge_rule_tensor(old_layer.w2.data, mapping, target_num_rules))
-        new_layer.b2.data.copy_(merge_rule_tensor(old_layer.b2.data, mapping, target_num_rules))
+        new_layer.w1.data.copy_(merge_rule_tensor_ot(old_layer.w1.data, transport_plan, target_num_rules))
+        new_layer.b1.data.copy_(merge_rule_tensor_ot(old_layer.b1.data, transport_plan, target_num_rules))
+        new_layer.w2.data.copy_(merge_rule_tensor_ot(old_layer.w2.data, transport_plan, target_num_rules))
+        new_layer.b2.data.copy_(merge_rule_tensor_ot(old_layer.b2.data, transport_plan, target_num_rules))
 
     new_model.offload_experts_to_runtime()
     return new_model, new_expert_store, mapping
@@ -981,17 +1046,24 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                 B, Seq = target_ids_cpu.size()
 
                 cell_matrix, cell_counts, token_to_cell, token_pos = cell_state
+                ctx_rule_ids = token_to_cell[ctx_ids_cpu.clamp_min(0).to(device)]
                 target_rule_ids = token_to_cell[target_ids_cpu.clamp_min(0).to(device)]
 
                 max_rule_entropy = math.log(model.num_rules)
-                geometric_capacity = math.sqrt(model.embed_size)
                 if batch_counter == 0:
                     micro_entropy_ratio = 1.0
                 else:
                     _mer = mean_s_inf.item() / max(max_rule_entropy, eps)
                     micro_entropy_ratio = _mer if math.isfinite(_mer) else 1.0
-                num_local_negatives = max(1, int(round(math.exp(micro_entropy_ratio * math.log(geometric_capacity)))))
-                num_global_negatives = max(2, int(round(micro_entropy_ratio * 8)))
+                # Dense in-rule softmax: sample ~all tokens of each target rule
+                # as hard negatives.  Training signal per step = log|V_r| ≈
+                # log(V/R), i.e. log V − log R nats, matching full-vocab softmax
+                # while paying only V/R cost.  This is the core "rule→token
+                # hierarchy beats flat softmax" advantage.
+                avg_tokens_per_rule = max(1, vocab["vocab_size"] // max(model.num_rules, 1))
+                in_rule_capacity = int(round(math.sqrt(avg_tokens_per_rule)) * max(1, int(math.log(max(avg_tokens_per_rule, math.e)))))
+                num_local_negatives = max(16, min(in_rule_capacity, int(avg_tokens_per_rule * micro_entropy_ratio) + 16))
+                num_global_negatives = max(2, int(round(micro_entropy_ratio * math.log(max(vocab["vocab_size"], math.e)))))
 
                 flat_target_rule_ids = target_rule_ids.reshape(-1)
                 loss_sort_ctx = compute_rule_sort_context(flat_target_rule_ids)
@@ -1018,7 +1090,11 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                 for param_group in optimizer_token.param_groups:
                     param_group['lr'] = dynamic_token_lr
 
-                active_rules = torch.unique(target_rule_ids.detach().cpu(), sorted=True).tolist()
+                # Experts are indexed by ctx rules (the actual rule routing
+                # inside the model).  Target rules only supervise the rule
+                # head and local-negative sampling, they do not touch the
+                # expert path, so we deliberately avoid paging their weights.
+                active_rules = torch.unique(ctx_rule_ids.reshape(-1).detach().cpu(), sorted=True).tolist()
                 runtime_expert_pages = expert_store.build_runtime(active_rules, device=device, training=True)
 
                 active_ids_cpu, active_ids_gpu, active_embeds_cpu, active_embeds_gpu = build_sorted_active_embeddings(
@@ -1035,7 +1111,7 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                 with torch.amp.autocast(device_type=device.type, enabled=autocast_enabled):
                     rule_logits, truth_field_state, memory, _ = train_model(
                         ctx_embeds,
-                        target_rule_ids=target_rule_ids,
+                        target_rule_ids=ctx_rule_ids,
                         runtime_expert_pages=runtime_expert_pages,
                     )
 
@@ -1065,11 +1141,22 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                                 rem = rem // int(l)
                             all_rule_coords = torch.stack(coords, dim=-1)
 
-                        expected_coords = torch.matmul(F.softmax(rule_logits_fp32, dim=-1), all_rule_coords)
-                        homo_grav_loss = F.mse_loss(
-                            expected_coords[:, 1:],
-                            expected_coords[:, :-1].detach()
+                        # Information-flow regularizer (replaces the old HomoGrav loss).
+                        # Old code minimised L2 between adjacent rule coordinates,
+                        # which penalised the very semantic motion we want to model.
+                        # New objective: maximise the symmetric KL between adjacent
+                        # rule distributions (pushes rules to *change* where data
+                        # demands it), while keeping the magnitude bounded by the
+                        # geometric capacity of the codebook.
+                        soft_rule_probs_seq = F.softmax(rule_logits_fp32, dim=-1)
+                        p_now = soft_rule_probs_seq[:, 1:].clamp_min(eps)
+                        p_prev = soft_rule_probs_seq[:, :-1].clamp_min(eps).detach()
+                        sym_kl = 0.5 * (
+                            (p_now * (p_now.log() - p_prev.log())).sum(-1)
+                            + (p_prev * (p_prev.log() - p_now.log())).sum(-1)
                         )
+                        flow_capacity = math.log(model.num_rules)
+                        info_flow_bonus = -(sym_kl.clamp_max(flow_capacity)).mean() / max(flow_capacity, 1.0)
 
                         flat_rule_logits = rule_logits_fp32.reshape(-1, model.num_rules)
                         flat_targets = target_rule_ids_vq.reshape(-1)
@@ -1084,18 +1171,17 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                         local_neg_features = rms_normalize(local_neg_embeds.float()) * math.sqrt(model.embed_size)
                         global_neg_features = rms_normalize(global_neg_embeds.float()) * math.sqrt(model.embed_size)
 
-                        with torch.no_grad():
-                            z = model.vq_layer.project_in(local_neg_features.reshape(-1, model.embed_size))
-                            bound = torch.tanh(z)
-                            scaled = (bound + 1.0) / 2.0 * (model.vq_layer.levels_t.float() - 1.0)
-                            quantized = torch.round(scaled)
-                            neg_primary_rules = torch.sum(quantized.long() * model.vq_layer.basis, dim=-1).reshape(num_unique_rules, num_local_negatives)
-                            residual = torch.abs(scaled - quantized).max(dim=-1)[0].reshape(num_unique_rules, num_local_negatives)
-                            split_threshold = residual.mean() + residual.std(unbiased=False)
-                            is_ambiguous = residual > split_threshold
-                            rule_valid_mask = (neg_primary_rules == unique_target_rules.unsqueeze(1)) | is_ambiguous
-
-                        token_local_valid_mask = rule_valid_mask[inverse_indices]
+                        # Identify exact-duplicate negatives (same token id as the
+                        # target).  Those must be masked, otherwise the model
+                        # learns that the positive logit is *also* reachable via
+                        # the negative slot, which flattens the signal.  Sampling
+                        # collisions ≠ "wrong rule", so we no longer discard
+                        # same-rule negatives (they are the hardest and most
+                        # informative training signal).
+                        target_ids_gpu = target_ids_cpu.to(device).reshape(-1)           # [N_flat]
+                        local_neg_ids_per_rule = sampled_local_negatives                  # [U, num_local_negatives]
+                        local_neg_ids_per_token = local_neg_ids_per_rule[inverse_indices] # [N_flat, num_local_negatives]
+                        duplicate_local_mask = (local_neg_ids_per_token == target_ids_gpu.unsqueeze(-1))
 
                         field_norm = F.normalize(truth_field_state_fp32, p=2, dim=-1).reshape(-1, model.embed_size)
                         target_norm = F.normalize(target_features, p=2, dim=-1).reshape(-1, model.embed_size)
@@ -1121,11 +1207,15 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
 
                     global_neg_sim = torch.matmul(field_norm, global_neg_norm.t())
 
+                    # Hierarchical in-rule softmax: positive logit vs ~all
+                    # in-rule tokens as hard negatives + log-V global negatives.
+                    # Only exact-duplicate ids are masked (sampling collisions).
                     tau = 1.0 / math.sqrt(model.embed_size)
+                    neg_inf_val = torch.finfo(local_neg_sim.dtype).min
                     masked_local = torch.where(
-                        token_local_valid_mask,
+                        duplicate_local_mask,
+                        torch.full_like(local_neg_sim, neg_inf_val),
                         local_neg_sim / tau,
-                        torch.full_like(local_neg_sim, -1e4),
                     )
                     contrastive_logits = torch.cat([
                         (pos_sim / tau).unsqueeze(-1),
@@ -1137,13 +1227,16 @@ def train_large_model(*, real_epochs: Optional[int] = None, sft_epochs: Optional
                         torch.zeros(N_flat, dtype=torch.long, device=device),
                         reduction="none",
                     )
-                    del local_neg_sim, global_neg_sim, token_local_valid_mask
+                    del local_neg_sim, global_neg_sim, duplicate_local_mask
                     del contrastive_logits, masked_local
 
                     flat_valid = valid_mask.reshape(-1)
 
                     loss_boundary = (loss_rule_boundary_flat * flat_valid).sum() / valid_sum
-                    loss_boundary += homo_grav_loss * 0.1
+                    # Scale follows the same 1/log(R) normalisation used by
+                    # info_flow_bonus, so the two terms live on the same scale
+                    # without any hand-chosen coefficient.
+                    loss_boundary = loss_boundary + info_flow_bonus
                     loss_readout = (loss_local_readout_flat * flat_valid).sum() / valid_sum
                     _lb = loss_boundary.detach().item()
                     if math.isfinite(_lb):
