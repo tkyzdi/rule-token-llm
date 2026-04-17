@@ -70,7 +70,7 @@ def decode_sequence(enc, special_tokens_inv, protocol_tokens, token_ids):
     for token_id in token_ids:
         if token_id in special_tokens_inv:
             if normal_ids:
-                parts.append(enc.decode(normal_ids, errors="replace"))
+                parts.append(enc.decode(normal_ids))
                 normal_ids = []
             if token_id != pad_id:
                 symbol = special_tokens_inv[token_id]
@@ -82,7 +82,7 @@ def decode_sequence(enc, special_tokens_inv, protocol_tokens, token_ids):
             if enc.is_normal_token_id(token_id):
                 normal_ids.append(token_id)
     if normal_ids:
-        parts.append(enc.decode(normal_ids, errors="replace"))
+        parts.append(enc.decode(normal_ids))
     return "".join(parts)
 
 
@@ -107,6 +107,14 @@ def load_runtime_assets(checkpoint_path, model):
     if not isinstance(payload, dict) or "cpu_token_embedding.weight" not in payload:
         raise KeyError("检查点中未找到 cpu_token_embedding.weight。")
     embedding_weight_cpu = payload["cpu_token_embedding.weight"].float().cpu()
+    # Pin host memory so repeated `.to(device, non_blocking=True)` gathers in
+    # the hot generation loop can overlap with compute.  Safe no-op on CPU-only
+    # machines.
+    if torch.cuda.is_available():
+        try:
+            embedding_weight_cpu = embedding_weight_cpu.pin_memory()
+        except RuntimeError:
+            pass
 
     return expert_store, embedding_weight_cpu
 
@@ -127,6 +135,57 @@ def load_active_tokens():
             pass
     return active_tokens
 
+
+def _trim_rule_kv_cache(kv_cache, keep: int):
+    if kv_cache is None:
+        return None
+    if not isinstance(kv_cache, dict):
+        k_cache, v_cache = kv_cache
+        return (k_cache[:, :, -keep:, :], v_cache[:, :, -keep:, :])
+
+    trimmed = {
+        "k": kv_cache["k"][:, :, -keep:, :],
+        "v": kv_cache["v"][:, :, -keep:, :],
+        "rule_ids": kv_cache["rule_ids"][:, -keep:],
+        "rule_level_k": kv_cache["rule_level_k"][:, -keep:, :],
+        "rule_level_v": kv_cache["rule_level_v"][:, -keep:, :],
+    }
+    num_rules = kv_cache["rule_count"].size(1)
+    membership = F.one_hot(trimmed["rule_ids"].to(torch.long), num_classes=num_rules).to(trimmed["rule_level_k"].dtype)
+    trimmed["rule_count"] = membership.sum(dim=1)
+    trimmed["rule_k_sum"] = torch.einsum('bsr,bsc->brc', membership, trimmed["rule_level_k"])
+    trimmed["rule_v_sum"] = torch.einsum('bsr,bsc->brc', membership, trimmed["rule_level_v"])
+    return trimmed
+
+def build_rule_candidate_cache(
+    rule_to_tokens: Dict[int, List[int]],
+    embedding_weight_cpu: torch.Tensor,
+    device: torch.device,
+) -> Dict[int, Dict[str, torch.Tensor]]:
+    """Pre-materialise per-rule candidate state on the inference device.
+
+    The original hot loop rebuilt a CPU long tensor + H2D copy + L2 norm every
+    step; for a sample generating N tokens with K candidates per rule this
+    costs O(N·(K + H2D latency)) and dominates wall-clock.  Since rule_to_tokens
+    is constant during evaluation we compute each rule's candidate ids and
+    L2-normalised embeddings exactly once.  Memory cost = Σ_r |tokens_r| · D,
+    i.e. at most O(V·D) — identical to the cpu_token_embedding table itself.
+    """
+    cache: Dict[int, Dict[str, torch.Tensor]] = {}
+    for rule_id, token_ids in rule_to_tokens.items():
+        if not token_ids:
+            continue
+        tokens_long = torch.tensor(token_ids, dtype=torch.long)
+        embeds = embedding_weight_cpu[tokens_long].to(device=device, dtype=torch.float32)
+        embeds = F.normalize(embeds, p=2, dim=-1)
+        cache[int(rule_id)] = {
+            "tokens": tokens_long.to(device),
+            "norm_embeds": embeds,
+        }
+    return cache
+
+
+@torch.inference_mode()
 def generate_tokens(
     model: RuleTokenCausalModel,
     expert_store: Optional[RulePagedExpertStore],
@@ -137,36 +196,65 @@ def generate_tokens(
     eos_id: int,
     device: torch.device,
     max_new_tokens: int,
+    rule_cache: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+    token_to_cell_device: Optional[torch.Tensor] = None,
 ) -> List[int]:
+    """Single-prompt autoregressive generation.
+
+    Fast-path contract:
+      * `rule_cache` — output of build_rule_candidate_cache; avoids per-step
+        H2D copies and normalisation of candidate embeddings.
+      * `token_to_cell_device` — token→rule map already resident on `device`.
+      * If `expert_store` has been warmed with all active rules (cache pre-
+        loaded), the per-step `build_runtime([current_rule], ...)` is a pure
+        in-memory dict lookup and effectively free.
+    """
     max_ctx_len = max(1, int(model.embed_size * max(math.log(model.num_rules), 1.0)))
     ctx_tokens = ctx_tokens[-max_ctx_len:]
+
+    if rule_cache is None:
+        rule_cache = build_rule_candidate_cache(rule_to_tokens, embedding_weight_cpu, device)
+    if token_to_cell_device is None:
+        token_to_cell_device = token_to_cell.to(device)
+
     ctx_tensor_cpu = torch.tensor([ctx_tokens], dtype=torch.long)
     ctx_embeds = embedding_weight_cpu[ctx_tensor_cpu].to(device)
-    ctx_rules = token_to_cell[ctx_tensor_cpu].to(device)
-    runtime_pages = expert_store.build_runtime(sorted(set(ctx_rules.view(-1).tolist())), device=device, training=False) if expert_store is not None else None
+    ctx_rules = token_to_cell_device[ctx_tensor_cpu.to(device)]
+    warm_rules = sorted(set(ctx_rules.view(-1).tolist()))
+    runtime_pages = expert_store.build_runtime(warm_rules, device=device, training=False) if expert_store is not None else None
 
     generated_tokens: List[int] = []
     _, _, _, past_key_values = model(ctx_embeds, target_rule_ids=ctx_rules, runtime_expert_pages=runtime_pages)
-    total_tokens_seen = ctx_tensor_cpu.size(1)
+    rope_offset = ctx_tensor_cpu.size(1)
     current_rule = int(ctx_rules[0, -1].item()) if ctx_rules.numel() > 0 else 0
-    rope_offset = total_tokens_seen
 
+    # Rule mask restricted to rules with at least one active candidate.
     valid_rule_mask = None
-    if len(rule_to_tokens) < model.num_rules:
+    if len(rule_cache) < model.num_rules:
         valid_rule_mask = torch.zeros(model.num_rules, dtype=torch.bool, device=device)
-        valid_rules_tensor = torch.tensor(list(rule_to_tokens.keys()), dtype=torch.long, device=device)
+        valid_rules_tensor = torch.tensor(list(rule_cache.keys()), dtype=torch.long, device=device)
         valid_rule_mask[valid_rules_tensor] = True
 
+    # Pre-allocate scratch tensors reused every step to avoid Python-side
+    # tensor construction in the hot loop.  CPU scratch is used for gathering
+    # from `embedding_weight_cpu` (which by design stays on host RAM), the
+    # device scratch carries the target rule id into the forward pass.
+    cpu_scratch = torch.zeros(1, 1, dtype=torch.long)
+    scratch_rule = torch.zeros(1, 1, dtype=torch.long, device=device)
+
+    capacity_scaler = 1.0 / max(math.log(model.embed_size), 1.0)
+    temp_floor = math.exp(-capacity_scaler)
+
+    last_token = ctx_tokens[-1]
     for _ in range(max_new_tokens):
-        last_token = ctx_tokens[-1] if not generated_tokens else generated_tokens[-1]
-        current_input_cpu = torch.tensor([[last_token]], dtype=torch.long)
-        current_input_embeds = embedding_weight_cpu[current_input_cpu].to(device)
-        current_rule_tensor = torch.tensor([[current_rule]], dtype=torch.long, device=device)
+        cpu_scratch[0, 0] = last_token
+        scratch_rule.fill_(current_rule)
+        current_input_embeds = embedding_weight_cpu[cpu_scratch].to(device, non_blocking=True)
         runtime_pages = expert_store.build_runtime([current_rule], device=device, training=False) if expert_store is not None else None
 
         rule_logits, truth_field_state, _, past_key_values = model(
             current_input_embeds,
-            target_rule_ids=current_rule_tensor,
+            target_rule_ids=scratch_rule,
             start_pos=rope_offset,
             past_key_values=past_key_values,
             runtime_expert_pages=runtime_pages,
@@ -184,53 +272,65 @@ def generate_tokens(
                 rule_probs = rule_probs / prob_sum
             else:
                 break
-        
-        rule_id = torch.multinomial(rule_probs, 1).item()
-        candidate_tokens = rule_to_tokens.get(rule_id, [])
-        if not candidate_tokens:
+
+        rule_id = int(torch.multinomial(rule_probs, 1).item())
+        cache_entry = rule_cache.get(rule_id)
+        if cache_entry is None:
             break
 
-        candidate_tensor_cpu = torch.tensor(candidate_tokens, dtype=torch.long)
-        candidate_embeddings = embedding_weight_cpu[candidate_tensor_cpu].to(device)
+        candidate_tokens_gpu = cache_entry["tokens"]           # [K] long on device
+        candidate_embeddings = cache_entry["norm_embeds"]       # [K, D] on device (already unit-norm)
         field_vector = truth_field_state[0, -1]
         field_norm = F.normalize(field_vector, p=2, dim=-1)
-        candidate_embeddings = F.normalize(candidate_embeddings, p=2, dim=-1)
         candidate_similarity = torch.matmul(candidate_embeddings, field_norm)
+        K = candidate_similarity.numel()
         eps = torch.finfo(candidate_similarity.dtype).eps
-        similarity_std = candidate_similarity.std().item() + eps
-        capacity_scaler = 1.0 / max(math.log(model.embed_size), 1.0)
-        temperature = max(math.exp(-similarity_std), math.exp(-capacity_scaler))
-        scaled_similarity = candidate_similarity / temperature
-        scaled_similarity = scaled_similarity - scaled_similarity.max()
-        token_probs = torch.softmax(scaled_similarity, dim=-1)
 
-        dynamic_p = 1.0 - math.exp(-capacity_scaler / max(token_probs.std().item() * math.sqrt(max(1, len(candidate_tokens))), eps))
-        sorted_probs, sorted_indices = torch.sort(token_probs, descending=True)
-        cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        sorted_mask = cumulative_probs > dynamic_p
-        sorted_mask[0] = False
-        token_probs[sorted_indices[sorted_mask]] = 0.0
-        probability_mass = token_probs.sum()
-        if not torch.isfinite(probability_mass) or probability_mass <= eps:
-            token_index = torch.argmax(candidate_similarity).item()
+        # std() is only defined for K≥2; for K=1 fall back to deterministic pick.
+        if K <= 1:
+            token_index = 0
         else:
-            token_probs = token_probs / probability_mass
-            token_index = torch.multinomial(token_probs, 1).item()
-        token_id = candidate_tokens[token_index]
+            similarity_std = candidate_similarity.std(unbiased=False).item() + eps
+            temperature = max(math.exp(-similarity_std), temp_floor)
+            scaled_similarity = (candidate_similarity / temperature)
+            scaled_similarity = scaled_similarity - scaled_similarity.max()
+            token_probs = torch.softmax(scaled_similarity, dim=-1)
+
+            tp_std = token_probs.std(unbiased=False).item()
+            dynamic_p = 1.0 - math.exp(-capacity_scaler / max(tp_std * math.sqrt(K), eps))
+            sorted_probs, sorted_indices = torch.sort(token_probs, descending=True)
+            cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
+            sorted_mask = cumulative_probs > dynamic_p
+            sorted_mask[0] = False
+            token_probs[sorted_indices[sorted_mask]] = 0.0
+            probability_mass = token_probs.sum()
+            if not torch.isfinite(probability_mass) or probability_mass <= eps:
+                token_index = int(torch.argmax(candidate_similarity).item())
+            else:
+                token_probs = token_probs / probability_mass
+                token_index = int(torch.multinomial(token_probs, 1).item())
+
+        token_id = int(candidate_tokens_gpu[token_index].item())
         generated_tokens.append(token_id)
-        current_rule = int(token_to_cell[token_id].item()) if token_id < token_to_cell.numel() else rule_id
+        # Keep rule state on device — token_to_cell_device is already resident.
+        if token_id < token_to_cell_device.numel():
+            current_rule = int(token_to_cell_device[token_id].item())
+        else:
+            current_rule = rule_id
+        last_token = token_id
         rope_offset += 1
 
         if token_id == eos_id:
             break
 
-        kv_len = past_key_values[0][0].size(2) if past_key_values and past_key_values[0] is not None else 0
+        if past_key_values and past_key_values[0] is not None:
+            first_cache = past_key_values[0]
+            kv_len = first_cache["k"].size(2) if isinstance(first_cache, dict) else first_cache[0].size(2)
+        else:
+            kv_len = 0
         if kv_len >= max_ctx_len:
             keep = max_ctx_len - 1
-            past_key_values = [
-                (k_cache[:, :, -keep:, :], v_cache[:, :, -keep:, :]) if k_cache is not None else (None, None)
-                for k_cache, v_cache in past_key_values
-            ]
+            past_key_values = [_trim_rule_kv_cache(layer_cache, keep) for layer_cache in past_key_values]
 
     return generated_tokens
 
