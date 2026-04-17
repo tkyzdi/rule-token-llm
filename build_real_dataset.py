@@ -12,6 +12,7 @@ from tokenizer_utils import (
     load_vocab_info,
     resolve_project_path,
     resolve_protocol_tokens,
+    sanitize_training_text,
     sliding_window_chunks,
     validate_sequence,
 )
@@ -23,10 +24,8 @@ def _extract_real_text(raw_line):
     try:
         data = json.loads(raw_line)
     except json.JSONDecodeError:
-        data = raw_line
-    if isinstance(data, dict):
-        return extract_record_text(data)
-    return raw_line if raw_line else None
+        return sanitize_training_text(raw_line)
+    return extract_record_text(data)
 
 
 def build_real_dataset(jsonl_path=None, max_seq_len=None):
