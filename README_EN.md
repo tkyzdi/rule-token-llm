@@ -8,19 +8,21 @@ This project is an innovative Large Language Model (LLM) training and inference 
 
 ## 🌟 Core Innovations
 
-1. **Rule Token Causal Model**
-   - Completely reconstructs the Token mapping mechanism, using continuous "rules" to guide generation, replacing traditional discrete Token prediction.
-   - Combines Finite Scalar Quantizer (FSQ) technology to achieve adaptive segmentation of the semantic space.
+1. **Rule Token Causal Model (Endogenous Rule-Region Paradigm)**
+   - Completely reconstructed the Token mapping mechanism, adopting the **Endogenous Rule-Region Paradigm**, which partitions the high-dimensional vocabulary space into "Gaussian manifolds" of rule regions.
+   - Inference becomes a two-step hierarchical calculation: 1. Macro-routing to locate the rule region; 2. Micro-collapse to locate the specific Token. It eliminates external hardcoded mappings to fully embrace endogenous gravitational routing.
+   - **Continuous Auto-Regressive Generation**: The model possesses autonomous termination capability by predicting a true `<EOS>`, completely eliminating hardcoded length limits and arbitrary punctuation-based stops.
 
-2. **Non-Euclidean Spherical Attention**
-   - Discards traditional unbounded Dot-product Attention, adopting Cosine Gravity on the L2 hypersphere.
-   - Truth is directional, not numerical magnitude. This effectively prevents the Curse of Dimensionality (inner product collapse in high-dimensional spaces) and ensures strict causality under sparse masks.
+2. **Non-Euclidean Spherical Attention & Top-Down Masking**
+   - Discards traditional unbounded Dot-product Attention, adopting Cosine Gravity on the L2 hypersphere. Truth is directional, not numerical magnitude.
+   - **Top-Down Attention Masking**: The Rules themselves decide the attention topology, forcing sparse and structurally relevant attention (e.g., Adjective to Noun) while masking out high-dimensional noise, significantly improving gradient fidelity.
 
 3. **RulePagedExpertStore (Rule-based Paged MoE)**
    - Dynamically calculates Rule usage frequency, automatically loading and unloading expert networks (Expert FFNs), achieving extremely fine-grained computational resource scheduling.
    - Significantly improves model parameter capacity without increasing VRAM pressure.
 
-4. **Adaptive Rule State (Adaptive Training Management)**
+4. **Fully Intelligent Driven Architecture**
+   - It **dynamically adjusts negative sampling** and temperature coefficients based on the geometric capacity ($\sqrt{embed\_size}$) and current information entropy.
    - Dynamically adjusts learning rate and rule quantity based on gradient norm and information entropy. Built-in Log-space EMA Gradient Tracker prevents the "death spiral" during training.
 
 ---
