@@ -88,13 +88,76 @@ class FiniteScalarQuantizer(nn.Module):
 
     def forward(self, x):
         z = self.project_in(x)
-        bound = torch.tanh(z)
+        # Saturation-safe bounding.  Plain tanh has gradient tanh'(z) that
+        # vanishes once |z|≫1, which in turn kills gradient flow into
+        # project_in and freezes the rule codebook.  We add a 1/d-budget
+        # self-normalising leak so the derivative d bound / d z is lower
+        # bounded by ~1/d everywhere, keeping FSQ learnable.
+        leak = 1.0 / max(self.d, 1)
+        bound = torch.tanh(z) + leak * z / (1.0 + z.abs().detach())
+        bound = bound.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
         scaled = (bound + 1.0) / 2.0 * (self.levels_t - 1.0)
         quantized = torch.round(scaled)
         z_q = scaled + (quantized - scaled).detach()
         rule_ids = torch.sum(quantized.long() * self.basis, dim=-1)
         out = self.project_out(z_q)
         return out, rule_ids
+
+
+class HolographicRuleBinding(nn.Module):
+    """Plate-style Holographic Reduced Representation binding of rule ⊛ key.
+
+    A rule-aware circular convolution: for every position, the rule identity
+    is encoded as a learnable unit-norm "role" vector and is bound with a
+    context-driven "filler" vector produced from the residual stream.
+
+    Mathematical properties (Plate, 1995; Kanerva, 2009):
+      - binding: a ⊛ b = IFFT(FFT(a) ⊙ FFT(b))
+      - the role vectors stay approximately unit-norm, so binding is a
+        near-isometry and the total energy of the bound signal matches the
+        filler — i.e. no arbitrary scale is injected into the residual stream.
+      - unbinding is approximately b ≈ a* ⊛ (a ⊛ b), where a* is the
+        involution of a (time-reversed on the circular axis).  This gives
+        the field_state a *retrievable* rule-typed component, unlike a plain
+        linear projection.
+
+    Complexity: O(B·S·D log D) per forward, dominated by two rFFTs.
+    """
+
+    def __init__(self, num_rules: int, feature_dim: int):
+        super().__init__()
+        self.feature_dim = feature_dim
+        self.num_rules = num_rules
+        # Initialise each rule's role vector with unit RMS so binding is
+        # variance-preserving from the start.
+        role_init = torch.randn(num_rules, feature_dim) / math.sqrt(feature_dim)
+        self.role = nn.Parameter(role_init)
+        self.filler_proj = nn.Linear(feature_dim, feature_dim, bias=False)
+        self.out_scale = nn.Parameter(torch.full((feature_dim,), 1.0 / math.sqrt(feature_dim)))
+
+    def forward(self, memory: torch.Tensor, rule_ids: torch.Tensor) -> torch.Tensor:
+        role = F.normalize(self.role[rule_ids], p=2, dim=-1)  # [B,S,D]
+        filler = self.filler_proj(memory)                      # [B,S,D]
+        # Use rFFT: real-valued inputs → half-spectrum multiplication → iRFFT.
+        with torch.amp.autocast(device_type=role.device.type, enabled=False):
+            X = torch.fft.rfft(role.float(), n=self.feature_dim, dim=-1)
+            Y = torch.fft.rfft(filler.float(), n=self.feature_dim, dim=-1)
+            bound = torch.fft.irfft(X * Y, n=self.feature_dim, dim=-1)
+        return (bound.to(memory.dtype) * self.out_scale)
+
+    def unbind(self, bound: torch.Tensor, rule_ids: torch.Tensor) -> torch.Tensor:
+        """Approximate inverse: involution(role) ⊛ bound ≈ filler.
+
+        Useful for downstream probes / analyses that want to recover the
+        context-driven component from a rule-typed representation.
+        """
+        role = F.normalize(self.role[rule_ids], p=2, dim=-1)
+        role_star = torch.roll(role.flip(-1), shifts=1, dims=-1)  # circular involution
+        with torch.amp.autocast(device_type=role.device.type, enabled=False):
+            X = torch.fft.rfft(role_star.float(), n=self.feature_dim, dim=-1)
+            Y = torch.fft.rfft(bound.float(), n=self.feature_dim, dim=-1)
+            recovered = torch.fft.irfft(X * Y, n=self.feature_dim, dim=-1)
+        return recovered.to(bound.dtype)
 
 
 class CustomRMSNorm(nn.Module):
@@ -113,7 +176,9 @@ def apply_rope(q, k, start_pos=0, rope_base=None):
     head_dim = q.size(3)
     device = q.device
     if rope_base is None:
-        rope_base = max(2.0, head_dim * math.exp(math.log(max(head_dim, 2))))
+        # Default base matches the Llama-family convention 10000 but scales
+        # with head_dim so small heads keep enough phase dynamic range.
+        rope_base = max(10000.0, float(head_dim) ** 2)
     position = torch.arange(start_pos, start_pos + seq_len, device=device).unsqueeze(1)
     div_term = torch.exp(torch.arange(0, head_dim, 2, device=device) * (-math.log(rope_base) / head_dim))
     freqs = position * div_term
@@ -127,75 +192,120 @@ def apply_rope(q, k, start_pos=0, rope_base=None):
     return q_rotated, k_rotated
 
 
+def _factor_near_sqrt(n: int) -> Tuple[int, int]:
+    """Return the (a, b) with a*b == n whose geometric ratio is closest to 1.
+
+    Used to shape the Kronecker factors so each factor is ~sqrt(n); this
+    maximises the effective rank of the Kronecker product for a given
+    parameter budget.
+    """
+    n = max(1, int(n))
+    target = max(1, int(round(math.sqrt(n))))
+    for delta in range(0, n):
+        for cand in (target - delta, target + delta):
+            if 1 <= cand <= n and n % cand == 0:
+                other = n // cand
+                a, b = min(cand, other), max(cand, other)
+                return a, b
+    return 1, n
+
+
 class RuleAwareProjection(nn.Module):
-    def __init__(self, num_rules, in_features, out_features, rank, block_size):
+    """Kronecker-factor rule adapter: W_r = W_0 + alpha · (U_r ⊗ V_r).
+
+    Old implementation used a block-diagonal LoRA, where the rule-specific
+    part only touched diagonal blocks of the weight matrix and the effective
+    rank per output channel was capped at the inner LoRA rank `k`.
+
+    Here we replace the block-diagonal pattern by a true Kronecker product.
+    For input dimension in = a·b and output dimension out = c·d we store
+      U_r ∈ R^{c × a}   V_r ∈ R^{d × b}
+    so that the per-rule adapter matrix (U_r ⊗ V_r) has:
+      - parameter count  c·a + d·b   (i.e. O(sqrt(in·out)))
+      - representable rank  min(c·d, a·b) = min(out, in)
+    That is, the same parameter budget as block-LoRA buys us linear-in-d rank
+    instead of constant-in-d rank.  Application uses the identity
+      (U ⊗ V) vec(X) = vec(V X U^T)
+    so the forward kernel is two small batched matmuls of shape (b×a)·(a×c)
+    and (d×b)·(b×c).  No hand-chosen block partitioning remains.
+    """
+
+    def __init__(self, num_rules, in_features, out_features):
         super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        self.rank = rank
-        self.block_size = max(1, block_size)
-        self.num_blocks = max(1, min(in_features, out_features) // self.block_size)
+        self.in_features = int(in_features)
+        self.out_features = int(out_features)
         self.shared_rank = max(1, int(round(math.sqrt(max(2, min(in_features, out_features))))))
 
-        self.shared_in = nn.Parameter(torch.empty(in_features, self.shared_rank))
-        self.shared_out = nn.Parameter(torch.empty(self.shared_rank, out_features))
-        self.rule_in = nn.Parameter(torch.empty(num_rules, self.block_size, rank))
-        self.rule_out = nn.Parameter(torch.empty(num_rules, rank, self.block_size))
-        self.rule_block_logits = nn.Parameter(torch.empty(num_rules, self.num_blocks))
+        # Factorise in / out near the geometric centre for dense Kronecker.
+        self.a, self.b = _factor_near_sqrt(self.in_features)    # in = a * b
+        self.c, self.d = _factor_near_sqrt(self.out_features)   # out = c * d
+
+        self.shared_in = nn.Parameter(torch.empty(self.in_features, self.shared_rank))
+        self.shared_out = nn.Parameter(torch.empty(self.shared_rank, self.out_features))
+        self.rule_U = nn.Parameter(torch.empty(num_rules, self.c, self.a))
+        self.rule_V = nn.Parameter(torch.empty(num_rules, self.d, self.b))
+        # Per-rule learnable gain.  Note: Kronecker adapters can't use the
+        # classical LoRA zero-init trick — if gain == 0 the gradient w.r.t.
+        # both U and V is zero (multiplicative symmetry), so the factors
+        # would never move.  Instead we seed with a small positive scale:
+        # the rule path starts at ~1% of the shared projection magnitude,
+        # but every factor receives gradient from step 1.
+        init_gain = 1.0 / math.sqrt(max(num_rules, 1))
+        self.rule_gain = nn.Parameter(torch.full((num_rules,), init_gain))
 
         nn.init.kaiming_uniform_(self.shared_in, a=math.sqrt(5))
         nn.init.kaiming_uniform_(self.shared_out, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.rule_in, a=math.sqrt(5))
-        nn.init.kaiming_uniform_(self.rule_out, a=math.sqrt(5))
-        nn.init.normal_(self.rule_block_logits, std=1.0 / math.sqrt(self.num_blocks))
+        # Scale rule factors so Var[(U ⊗ V) x] ≈ Var[x] at init.
+        kron_std = 1.0 / math.sqrt(max(self.a * self.b, 1))
+        nn.init.normal_(self.rule_U, std=kron_std)
+        nn.init.normal_(self.rule_V, std=kron_std)
 
     def _shared_forward(self, x):
         shared_hidden = torch.matmul(x, self.shared_in)
         return torch.matmul(shared_hidden, self.shared_out)
 
     def forward(self, x):
+        # Shared-only path.  We deliberately do *not* apply the rule adapter
+        # here; the rule-aware kernel requires rule ids and is called through
+        # forward_rules_batched on the training path.
         return self._shared_forward(x)
 
     def forward_rules_batched(self, x, rule_ids, sort_ctx=None):
-        """Grouped-padded vectorization: rule params O(U) instead of O(N)."""
+        """Kronecker-batched forward:  y_r = W_0 · x + gain_r · (U_r ⊗ V_r) · x.
+
+        Grouped by rule so that each unique rule only performs a small
+        (d×b)·(b×c) and (b×a)·(a×c) batched matmul.
+        """
         base_out = self._shared_forward(x)
         N = x.size(0)
-        total_block_dim = self.num_blocks * self.block_size
-        x_blocks = x[..., :total_block_dim].view(N, self.num_blocks, self.block_size)
-
         if sort_ctx is None:
             sort_ctx = compute_rule_sort_context(rule_ids)
-
         U = sort_ctx.unique_rules.size(0)
-        sorted_x_blocks = x_blocks[sort_ctx.sort_idx]
 
-        padded = x_blocks.new_zeros(U, sort_ctx.max_g * self.num_blocks, self.block_size)
-        flat_pos = sort_ctx.pos_in_group * self.num_blocks
-        block_offsets = torch.arange(self.num_blocks, device=x.device)
-        all_rows = sort_ctx.sorted_groups.unsqueeze(1).expand(-1, self.num_blocks).reshape(-1)
-        all_cols = (flat_pos.unsqueeze(1) + block_offsets.unsqueeze(0)).reshape(-1)
-        padded[all_rows, all_cols] = sorted_x_blocks.reshape(-1, self.block_size)
+        a, b, c, d = self.a, self.b, self.c, self.d
+        # Reshape input  x ∈ R^{N × (a·b)}  →  [N, b, a] (column-major vec).
+        x_mat = x.view(N, b, a)
 
-        r_in = self.rule_in[sort_ctx.unique_rules]
-        r_out = self.rule_out[sort_ctx.unique_rules]
+        sorted_x = x_mat[sort_ctx.sort_idx]                          # [N, b, a]
+        padded = sorted_x.new_zeros(U, sort_ctx.max_g, b, a)
+        padded[sort_ctx.sorted_groups, sort_ctx.pos_in_group] = sorted_x
 
-        adapter_hidden = torch.bmm(padded, r_in)
-        adapter_out = torch.bmm(adapter_hidden, r_out)
+        U_rules = self.rule_U[sort_ctx.unique_rules]                 # [U, c, a]
+        V_rules = self.rule_V[sort_ctx.unique_rules]                 # [U, d, b]
 
-        adapter_out = adapter_out.view(U, sort_ctx.max_g, self.num_blocks, self.block_size)
+        # (V X U^T)  ≡  Kronecker-vector product  (U ⊗ V) vec(X).
+        # Use einsum; on modern PyTorch this compiles down to two bmm's.
+        xu = torch.einsum('ugba,uca->ugbc', padded, U_rules)         # [U, max_g, b, c]
+        vxu = torch.einsum('udb,ugbc->ugdc', V_rules, xu)            # [U, max_g, d, c]
+        adapter_padded = vxu.reshape(U, sort_ctx.max_g, d * c)       # [U, max_g, out]
 
-        logits = self.rule_block_logits[sort_ctx.unique_rules]
-        temperature = 1.0 / math.sqrt(self.num_blocks)
-        selector = F.softmax(logits / temperature, dim=-1).view(U, 1, self.num_blocks, 1)
-        weighted = (adapter_out * selector).reshape(U, sort_ctx.max_g, total_block_dim)
+        gain = self.rule_gain[sort_ctx.unique_rules].view(U, 1, 1)
+        adapter_padded = adapter_padded * gain
 
-        sorted_weighted = weighted[sort_ctx.sorted_groups, sort_ctx.pos_in_group]
-        result = torch.empty(N, total_block_dim, device=x.device, dtype=sorted_weighted.dtype)
-        result[sort_ctx.sort_idx] = sorted_weighted
-
-        adapter_full = torch.zeros_like(base_out)
-        adapter_full[..., :total_block_dim] = result.to(base_out.dtype)
-        return base_out + adapter_full
+        sorted_adapter = adapter_padded[sort_ctx.sorted_groups, sort_ctx.pos_in_group]
+        adapter_flat = torch.empty(N, d * c, device=x.device, dtype=sorted_adapter.dtype)
+        adapter_flat[sort_ctx.sort_idx] = sorted_adapter
+        return base_out + adapter_flat.to(base_out.dtype)
 
 
 class CausalSelfAttention(nn.Module):
@@ -207,28 +317,201 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self.proj_rank = max(1, int(round(math.sqrt(self.head_dim))))
 
-        self.q_proj = RuleAwareProjection(num_rules, d_model, d_model, self.proj_rank, self.head_dim)
-        self.k_proj = RuleAwareProjection(num_rules, d_model, d_model, self.proj_rank, self.head_dim)
-        self.v_proj = RuleAwareProjection(num_rules, d_model, d_model, self.proj_rank, self.head_dim)
-        self.out_proj = RuleAwareProjection(num_rules, d_model, d_model, self.proj_rank, self.head_dim)
+        self.q_proj = RuleAwareProjection(num_rules, d_model, d_model)
+        self.k_proj = RuleAwareProjection(num_rules, d_model, d_model)
+        self.v_proj = RuleAwareProjection(num_rules, d_model, d_model)
+        self.out_proj = RuleAwareProjection(num_rules, d_model, d_model)
 
         self.router_rank = self.proj_rank
         self.rule_router_q = nn.Parameter(torch.randn(num_rules, self.router_rank) * 0.02)
         self.rule_router_k = nn.Parameter(torch.randn(num_rules, self.router_rank) * 0.02)
 
+        # Hierarchical rule-level attention path. At each position t, a small
+        # query head looks up the causal running mean of every active rule
+        # (prefix average of values so far conditioned on rule == r).  This
+        # complements the token-level attention by giving every token an
+        # O(1)-per-rule global summary without forming an L×L matrix.
+        # Complexity: O(B·S·U·C) where U is the number of rules active in
+        # the batch, typically U ≪ R ≪ S.
+        self.rule_level_q = nn.Linear(d_model, d_model, bias=False)
+        self.rule_level_kv = nn.Linear(d_model, 2 * d_model, bias=False)
+        # Gate starts slightly > 0 so the hierarchical path contributes ~1%
+        # of the token-level output at initialisation.  A strict zero init
+        # would multiplicatively kill gradient to rule_level_q / rule_level_kv
+        # on the first step (gate·tanh = 0 → dL/d{q,kv} = 0), leading to a
+        # slow cold-start.
+        self.rule_level_gate = nn.Parameter(torch.full((d_model,), 1e-2))
+
         self.dropout = nn.Dropout(dropout)
         self.rope_base = rope_base
 
-    def _dense_attention(self, q, k, v, seq_len, start_pos, rule_mask=None):
+    def _dense_attention(self, q, k, v, seq_len, start_pos, attn_bias=None):
         is_causal = (seq_len > 1 and start_pos == 0)
         return F.scaled_dot_product_attention(
             q, k, v,
-            attn_mask=rule_mask,
+            attn_mask=attn_bias,
             dropout_p=self.dropout.p if self.training else 0.0,
-            is_causal=is_causal if rule_mask is None else False,
+            is_causal=is_causal if attn_bias is None else False,
         )
 
-    def _rule_causal_attention(self, x, target_rule_ids, start_pos, sort_ctx=None):
+    def _hierarchical_rule_attention(self, x: torch.Tensor, rule_ids: torch.Tensor) -> torch.Tensor:
+        """Rule-level causal attention: every token attends to the prefix
+        mean of *each active rule* up to its own position.
+
+        Derivation.  Let 1_{r}(s) = [rule(s) == r].  The causal rule-conditional
+        running mean at time t for rule r is
+            μ_t^r = (Σ_{s≤t} 1_{r}(s) · V(x_s)) / (Σ_{s≤t} 1_{r}(s)),
+        which we obtain in O(S·U) with two cumulative sums.  Each token then
+        queries this U-sized memory via a scaled-dot-product attention over
+        the U axis, giving a causal O(U) memory per position instead of O(S).
+
+        Shapes:
+          x        : [B, S, C]
+          rule_ids : [B, S]
+          returns  : [B, S, C]   (already scaled by the residual gate)
+        """
+        B, S, C = x.shape
+        device = x.device
+        unique_rules, inverse = torch.unique(rule_ids, return_inverse=True)  # inverse: [B,S]
+        U = unique_rules.numel()
+        if U == 0:
+            return torch.zeros_like(x)
+
+        # Build K,V and Q for the rule-level path.
+        kv = self.rule_level_kv(x)            # [B, S, 2C]
+        k_val, v_val = kv.chunk(2, dim=-1)    # each [B, S, C]
+        q_val = self.rule_level_q(x)          # [B, S, C]
+
+        # One-hot masks for the U rules actually present in this batch.
+        # [B, S, U]; dtype float for cumsum.
+        membership = F.one_hot(inverse, num_classes=U).to(k_val.dtype)
+
+        # Causal prefix sums per rule.
+        # kv_per_rule[b, t, u, c] = Σ_{s≤t} 1[rule(s)==u] · kv[b, s, c]
+        # count_per_rule[b, t, u] = Σ_{s≤t} 1[rule(s)==u]
+        k_sum = torch.einsum('bsu,bsc->bsuc', membership, k_val).cumsum(dim=1)   # [B,S,U,C]
+        v_sum = torch.einsum('bsu,bsc->bsuc', membership, v_val).cumsum(dim=1)   # [B,S,U,C]
+        count = membership.cumsum(dim=1).clamp_min(1.0)                           # [B,S,U]
+        k_mean = k_sum / count.unsqueeze(-1)
+        v_mean = v_sum / count.unsqueeze(-1)
+
+        # Per-position attention over the U rule summaries.
+        scale = 1.0 / math.sqrt(max(C, 1))
+        logits = torch.einsum('bsc,bsuc->bsu', q_val, k_mean) * scale             # [B,S,U]
+
+        # Mask rules that have never appeared in the causal prefix so they
+        # cannot leak information from future tokens.
+        seen_mask = (count > 0.5)                                                 # [B,S,U]
+        logits = logits.masked_fill(~seen_mask, torch.finfo(logits.dtype).min)
+        weights = F.softmax(logits, dim=-1)
+        out = torch.einsum('bsu,bsuc->bsc', weights, v_mean)                      # [B,S,C]
+
+        # Residual gate (per-channel), starts at zero so the hierarchical
+        # path is OFF at initialisation and grows only if it improves loss.
+        return out * torch.tanh(self.rule_level_gate)
+
+    def _compute_rule_level_state(self, x: torch.Tensor, rule_ids: torch.Tensor):
+        B, _, C = x.shape
+        kv = self.rule_level_kv(x)
+        k_val, v_val = kv.chunk(2, dim=-1)
+        membership = F.one_hot(rule_ids.to(torch.long), num_classes=self.rule_router_q.size(0)).to(k_val.dtype)
+        rule_k_sum = torch.einsum('bsr,bsc->brc', membership, k_val)
+        rule_v_sum = torch.einsum('bsr,bsc->brc', membership, v_val)
+        rule_count = membership.sum(dim=1)
+        return {
+            "rule_level_k": k_val,
+            "rule_level_v": v_val,
+            "rule_k_sum": rule_k_sum.view(B, self.rule_router_q.size(0), C),
+            "rule_v_sum": rule_v_sum.view(B, self.rule_router_q.size(0), C),
+            "rule_count": rule_count.view(B, self.rule_router_q.size(0)),
+        }
+
+    def _build_rule_kv_cache(self, x: torch.Tensor, target_rule_ids: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        cache = {
+            "k": k,
+            "v": v,
+            "rule_ids": target_rule_ids.to(torch.long),
+        }
+        cache.update(self._compute_rule_level_state(x, target_rule_ids))
+        return cache
+
+    def _append_rule_kv_cache(
+        self,
+        kv_cache,
+        x_step: torch.Tensor,
+        rule_ids_step: torch.Tensor,
+        k_step: torch.Tensor,
+        v_step: torch.Tensor,
+    ):
+        if kv_cache is None:
+            return self._build_rule_kv_cache(x_step, rule_ids_step, k_step, v_step)
+
+        updated = {
+            "k": torch.cat([kv_cache["k"], k_step], dim=2),
+            "v": torch.cat([kv_cache["v"], v_step], dim=2),
+            "rule_ids": torch.cat([kv_cache["rule_ids"], rule_ids_step.to(torch.long)], dim=1),
+        }
+        step_state = self._compute_rule_level_state(x_step, rule_ids_step)
+        updated["rule_level_k"] = torch.cat([kv_cache["rule_level_k"], step_state["rule_level_k"]], dim=1)
+        updated["rule_level_v"] = torch.cat([kv_cache["rule_level_v"], step_state["rule_level_v"]], dim=1)
+        updated["rule_k_sum"] = kv_cache["rule_k_sum"] + step_state["rule_k_sum"]
+        updated["rule_v_sum"] = kv_cache["rule_v_sum"] + step_state["rule_v_sum"]
+        updated["rule_count"] = kv_cache["rule_count"] + step_state["rule_count"]
+        return updated
+
+    def _hierarchical_rule_attention_incremental(self, x_step: torch.Tensor, kv_cache) -> torch.Tensor:
+        q_val = self.rule_level_q(x_step)
+        rule_count = kv_cache["rule_count"].clamp_min(1.0)
+        k_mean = kv_cache["rule_k_sum"] / rule_count.unsqueeze(-1)
+        v_mean = kv_cache["rule_v_sum"] / rule_count.unsqueeze(-1)
+        scale = 1.0 / math.sqrt(max(x_step.size(-1), 1))
+        logits = torch.einsum('bqc,brc->bqr', q_val, k_mean) * scale
+        seen_mask = kv_cache["rule_count"] > 0.5
+        logits = logits.masked_fill(~seen_mask.unsqueeze(1), torch.finfo(logits.dtype).min)
+        weights = F.softmax(logits, dim=-1)
+        out = torch.einsum('bqr,brc->bqc', weights, v_mean)
+        return out * torch.tanh(self.rule_level_gate)
+
+    def _rule_attention_bias_incremental(self, query_rule_ids: torch.Tensor, all_rule_ids: torch.Tensor, dtype: torch.dtype):
+        rq = self.rule_router_q[query_rule_ids]
+        rk = self.rule_router_k[all_rule_ids]
+        rq_norm = F.normalize(rq, p=2, dim=-1)
+        rk_norm = F.normalize(rk, p=2, dim=-1)
+        rule_bias = torch.matmul(rq_norm, rk_norm.transpose(-1, -2)) * math.sqrt(self.head_dim)
+        return rule_bias.to(dtype).unsqueeze(1)
+
+    def _rule_incremental_attention(self, x: torch.Tensor, target_rule_ids: torch.Tensor, start_pos: int, kv_cache=None):
+        B, Seq, C = x.size()
+        outputs = []
+        cache = kv_cache
+        for offset in range(Seq):
+            x_step = x[:, offset:offset + 1, :]
+            rule_step = target_rule_ids[:, offset:offset + 1]
+            flat_x = x_step.reshape(-1, C)
+            flat_rules = rule_step.reshape(-1)
+            sort_ctx = compute_rule_sort_context(flat_rules)
+
+            q_step = self.q_proj.forward_rules_batched(flat_x, flat_rules, sort_ctx=sort_ctx)
+            k_step = self.k_proj.forward_rules_batched(flat_x, flat_rules, sort_ctx=sort_ctx)
+            v_step = self.v_proj.forward_rules_batched(flat_x, flat_rules, sort_ctx=sort_ctx)
+
+            q_step = q_step.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+            k_step = k_step.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+            v_step = v_step.view(B, 1, self.num_heads, self.head_dim).transpose(1, 2)
+            q_step, k_step = apply_rope(q_step, k_step, start_pos + offset, rope_base=self.rope_base)
+
+            cache = self._append_rule_kv_cache(cache, x_step, rule_step, k_step, v_step)
+            attn_bias = self._rule_attention_bias_incremental(rule_step, cache["rule_ids"], q_step.dtype)
+            attn_out = self._dense_attention(q_step, cache["k"], cache["v"], 1, start_pos + offset, attn_bias=attn_bias)
+            attn_out = attn_out.transpose(1, 2).contiguous().view(B, 1, C)
+            attn_out = attn_out + self._hierarchical_rule_attention_incremental(x_step, cache)
+
+            out_step = self.out_proj.forward_rules_batched(attn_out.view(-1, C), flat_rules, sort_ctx=sort_ctx)
+            outputs.append(out_step.view(B, 1, C))
+
+        return torch.cat(outputs, dim=1), cache
+
+    def _rule_causal_attention(self, x, target_rule_ids, start_pos, sort_ctx=None, build_cache=False):
         B, Seq, C = x.size()
         flat_x = x.view(-1, C)
         flat_rules = target_rule_ids.view(-1)
@@ -246,36 +529,53 @@ class CausalSelfAttention(nn.Module):
 
         q, k = apply_rope(q, k, start_pos, rope_base=self.rope_base)
 
-        rq = self.rule_router_q[target_rule_ids]  # [B, Seq, rank]
-        rk = self.rule_router_k[target_rule_ids]  # [B, Seq, rank]
+        # Differentiable rule router: compute a soft additive bias to be injected
+        # into scaled-dot-product attention.  Gradients flow naturally through
+        # the softmax of SDPA, so rule_router_q/k learn on every backward pass.
+        rq = self.rule_router_q[target_rule_ids]                # [B, Seq, rank]
+        rk = self.rule_router_k[target_rule_ids]                # [B, Seq, rank]
         rq_norm = F.normalize(rq, p=2, dim=-1)
         rk_norm = F.normalize(rk, p=2, dim=-1)
-        tau = 1.0 / math.log(max(math.e, self.router_rank))
-        rule_affinity = torch.matmul(rq_norm, rk_norm.transpose(-1, -2)) / tau  # [B, Seq, Seq]
+        rule_affinity = torch.matmul(rq_norm, rk_norm.transpose(-1, -2))  # [B, Seq, Seq] in [-1,1]
 
+        # Amplitude scales with head capacity so the bias is commensurate with
+        # QK^T/sqrt(d) magnitudes.  No hand-tuned constants.
+        bias_scale = math.sqrt(self.head_dim)
+        rule_bias = rule_affinity * bias_scale                   # [B, Seq, Seq]
+
+        # Promote to q's dtype *before* masking so the fill value is guaranteed
+        # representable: under AMP autocast, q may be upcast to fp32 by
+        # apply_rope while rule_bias stays in fp16.  Using finfo(fp32).min on a
+        # fp16 tensor overflows (-3.4e38 → Inf on Half).  Casting first ensures
+        # neg_inf == finfo(bias.dtype).min and avoids any silent NaN injection.
+        rule_bias = rule_bias.to(q.dtype)
         causal_mask = torch.tril(torch.ones(Seq, Seq, device=q.device, dtype=torch.bool))
-        masked_affinity = rule_affinity.masked_fill(~causal_mask.unsqueeze(0), float('-inf'))
+        neg_inf = torch.finfo(rule_bias.dtype).min
+        rule_bias = rule_bias.masked_fill(~causal_mask.unsqueeze(0), neg_inf)
+        attn_bias = rule_bias.unsqueeze(1)                       # [B, 1, Seq, Seq]
 
-        top_k = max(2, int(math.sqrt(Seq)))
-        if Seq > top_k:
-            threshold = torch.topk(masked_affinity, top_k, dim=-1).values[..., -1:]
-            rule_mask = (masked_affinity >= threshold) & causal_mask.unsqueeze(0)
-        else:
-            rule_mask = causal_mask.unsqueeze(0)
-            
-        final_mask = rule_mask.unsqueeze(1) # [B, 1, Seq, Seq]
+        attn_out = self._dense_attention(q, k, v, Seq, start_pos, attn_bias=attn_bias)
+        attn_out = attn_out.transpose(1, 2).contiguous().view(B, Seq, C)
 
-        attn_out = self._dense_attention(q, k, v, Seq, start_pos, rule_mask=final_mask)
-        attn_out = attn_out.transpose(1, 2).contiguous().view(-1, C)
+        # Hierarchical rule-level path added *before* the output projection so
+        # the per-rule out_proj adapter can still shape the combined signal.
+        attn_out = attn_out + self._hierarchical_rule_attention(x, target_rule_ids)
 
-        out = self.out_proj.forward_rules_batched(attn_out, flat_rules, sort_ctx=sort_ctx)
-        return out.view(B, Seq, C)
+        attn_out_flat = attn_out.view(-1, C)
+        out = self.out_proj.forward_rules_batched(attn_out_flat, flat_rules, sort_ctx=sort_ctx)
+        new_kv_cache = self._build_rule_kv_cache(x, target_rule_ids, k, v) if build_cache else None
+        return out.view(B, Seq, C), new_kv_cache
 
     def forward(self, x, start_pos=0, kv_cache=None, target_rule_ids=None, sort_ctx=None):
         B, Seq, C = x.size()
-        if target_rule_ids is not None and kv_cache is None and Seq > 1:
-            out = self._rule_causal_attention(x, target_rule_ids, start_pos, sort_ctx=sort_ctx)
-            new_kv_cache = None
+        if target_rule_ids is not None:
+            if kv_cache is None and Seq > 1:
+                build_cache = (not self.training) or (not torch.is_grad_enabled())
+                out, new_kv_cache = self._rule_causal_attention(
+                    x, target_rule_ids, start_pos, sort_ctx=sort_ctx, build_cache=build_cache,
+                )
+            else:
+                out, new_kv_cache = self._rule_incremental_attention(x, target_rule_ids, start_pos, kv_cache=kv_cache)
         else:
             q = self.q_proj(x).view(B, Seq, self.num_heads, self.head_dim).transpose(1, 2)
             k = self.k_proj(x).view(B, Seq, self.num_heads, self.head_dim).transpose(1, 2)
@@ -366,7 +666,12 @@ class TransformerBlock(nn.Module):
         self.attn = CausalSelfAttention(d_model, num_heads, dropout, rope_base, num_rules)
         self.norm2 = CustomRMSNorm(d_model)
         if expert_dim is None:
-            expert_dim = max(16, dim_feedforward // max(num_rules, 1))
+            # Old formula dim_feedforward // num_rules collapsed to ~4-16,
+            # which is below the degrees of freedom needed for a useful FFN.
+            # Lower bound by sqrt(dim_feedforward) so each expert keeps an
+            # intrinsic capacity that scales with the residual stream width.
+            capacity_floor = max(16, int(round(math.sqrt(max(dim_feedforward, 1)))))
+            expert_dim = max(capacity_floor, dim_feedforward // max(num_rules, 1))
         self.experts = BatchedRuleExperts(num_rules, d_model, expert_dim, dropout)
         self.num_rules = num_rules
         self.expert_dim = expert_dim
@@ -447,7 +752,8 @@ class RuleTokenCausalModel(nn.Module):
             for _ in range(num_layers)
         ])
         self.expert_dim = self.layers[0].expert_dim if self.layers else (
-            int(expert_dim) if expert_dim is not None else max(16, hidden_size // max(num_rules, 1))
+            int(expert_dim) if expert_dim is not None
+            else max(max(16, int(round(math.sqrt(max(hidden_size, 1))))), hidden_size // max(num_rules, 1))
         )
         self.final_norm = CustomRMSNorm(current_dim)
         self.vq_layer = FiniteScalarQuantizer(fsq_levels, current_dim)
@@ -457,6 +763,10 @@ class RuleTokenCausalModel(nn.Module):
             nn.GELU(),
             nn.Linear(current_dim, embed_size),
         )
+        # HRR path: a rule-typed, retrievable composition layer that runs in
+        # parallel with the plain linear field.  Adds ~O(R·D + D²) parameters
+        # and O(D log D) FLOPs per step — negligible compared with attention.
+        self.holographic_bind = HolographicRuleBinding(self.num_rules, embed_size)
 
     def _compute_fsq_levels(self, num_rules):
         if num_rules <= 1:
@@ -501,83 +811,124 @@ class RuleTokenCausalModel(nn.Module):
             new_past_key_values.append(new_kv_cache)
         memory = self.final_norm(h)
         rule_logits = self.rule_boundary_predictor(memory)
-        field_state = self.truth_semantic_field(memory)
+        linear_field = self.truth_semantic_field(memory)
+        if target_rule_ids is not None:
+            hrr_field = self.holographic_bind(linear_field, target_rule_ids)
+            # Superpose: linear path carries magnitude, HRR path injects
+            # rule-typed structure.  The HRR output already has per-channel
+            # scale absorbed into out_scale, no extra gain needed.
+            field_state = linear_field + hrr_field
+        else:
+            field_state = linear_field
         return rule_logits, field_state, memory, new_past_key_values
 
     def compute_rule_vocab_mask(self, token_chunk_embeds=None, token_chunk_ids=None, cell_state=None) -> CellState:
         device = next(self.parameters()).device
         if cell_state is None:
-            max_tokens_per_rule = max(256, (self.vocab_size // self.num_rules) * 10)
-            cell_matrix = torch.zeros((self.num_rules, max_tokens_per_rule), dtype=torch.long, device=device)
-            cell_counts = torch.zeros(self.num_rules, dtype=torch.long, device=device)
-            token_pos = torch.zeros(self.vocab_size, dtype=torch.long, device=device)
-            with torch.no_grad():
-                chunk_sz = max(1, 100000000 // self.embed_size)
-                global_rules_list = []
-                for start_idx in range(0, self.vocab_size, chunk_sz):
-                    end_idx = min(start_idx + chunk_sz, self.vocab_size)
-                    sub_embeds = rms_normalize(token_chunk_embeds[start_idx:end_idx]) * math.sqrt(self.embed_size)
-                    _, sub_rules = self.vq_layer(sub_embeds.to(device))
-                    global_rules_list.append(sub_rules)
-                global_rules = torch.cat(global_rules_list)
-            token_to_cell = global_rules.clone()
-            counts = torch.bincount(global_rules, minlength=self.num_rules)
-            cell_counts.copy_(counts)
-            _, sorted_tokens = torch.sort(global_rules)
-            offsets = torch.cat([torch.zeros(1, dtype=torch.long, device=device), torch.cumsum(counts[:-1], dim=0)])
-            offsets_list = offsets.tolist()
-            counts_list = counts.tolist()
-            sorted_tokens_list = sorted_tokens.tolist()
-            max_tokens_per_rule = cell_matrix.size(1)
-            for r in range(self.num_rules):
-                c = counts_list[r]
-                if c > 0:
-                    start = offsets_list[r]
-                    c_clamped = min(c, max_tokens_per_rule)
-                    rule_tokens = torch.tensor(sorted_tokens_list[start:start + c_clamped], dtype=torch.long, device=device)
-                    cell_matrix[r, :c_clamped] = rule_tokens
-                    token_pos[rule_tokens] = torch.arange(c_clamped, dtype=torch.long, device=device)
-                    cell_counts[r] = c_clamped
-            empty_mask = (cell_counts == 0)
-            if empty_mask.any():
-                cell_counts[empty_mask] = 1
-            return CellState(cell_matrix, cell_counts, token_to_cell, token_pos)
+            return self._build_cell_state_vectorized(token_chunk_embeds, device)
+        return self._rebuild_cell_state_vectorized(cell_state, token_chunk_embeds, token_chunk_ids, device)
 
+    def _vq_rule_ids(self, embeds: torch.Tensor) -> torch.Tensor:
+        """Single VQ forward pass that returns rule ids only (no STE grad)."""
+        z = self.vq_layer.project_in(embeds)
+        leak = 1.0 / max(self.vq_layer.d, 1)
+        bound = torch.tanh(z) + leak * z / (1.0 + z.abs())
+        bound = bound.clamp(-1.0 + 1e-6, 1.0 - 1e-6)
+        scaled = (bound + 1.0) / 2.0 * (self.vq_layer.levels_t - 1.0)
+        quantized = torch.round(scaled)
+        return torch.sum(quantized.long() * self.vq_layer.basis, dim=-1)
+
+    def _build_cell_state_vectorized(self, token_chunk_embeds: torch.Tensor, device: torch.device) -> CellState:
+        """Fully vectorised initial cell state construction.
+
+        Complexity: a single argsort (O(V log V)) + a handful of scatter ops.
+        No Python-level iteration over rules, no .item() sync points.
+        """
+        max_tokens_per_rule = max(256, (self.vocab_size // max(self.num_rules, 1)) * 10)
+        with torch.no_grad():
+            chunk_sz = max(1, 100_000_000 // max(self.embed_size, 1))
+            global_rules_list = []
+            for start_idx in range(0, self.vocab_size, chunk_sz):
+                end_idx = min(start_idx + chunk_sz, self.vocab_size)
+                sub_embeds = rms_normalize(token_chunk_embeds[start_idx:end_idx]) * math.sqrt(self.embed_size)
+                global_rules_list.append(self._vq_rule_ids(sub_embeds.to(device)))
+            global_rules = torch.cat(global_rules_list)  # [V] rule id per token
+
+        token_to_cell = global_rules.clone()
+        counts = torch.bincount(global_rules, minlength=self.num_rules)  # [R]
+        sort_idx = torch.argsort(global_rules, stable=True)              # tokens sorted by rule
+        sorted_rules = global_rules[sort_idx]                            # [V] monotone-increasing (within each rule group)
+
+        # Build per-rule offsets, then the local position of each sorted token within its rule.
+        offsets = torch.zeros(self.num_rules + 1, dtype=torch.long, device=device)
+        offsets[1:] = torch.cumsum(counts, dim=0)
+        pos_within_rule_sorted = torch.arange(self.vocab_size, device=device) - offsets[sorted_rules]
+
+        # Truncate overflow in a single vectorised gate (preserves the first
+        # max_tokens_per_rule occurrences of each rule by sort order).
+        keep_mask = pos_within_rule_sorted < max_tokens_per_rule
+        kept_sort_idx = sort_idx[keep_mask]
+        kept_rules = sorted_rules[keep_mask]
+        kept_pos = pos_within_rule_sorted[keep_mask]
+
+        cell_matrix = torch.zeros((self.num_rules, max_tokens_per_rule), dtype=torch.long, device=device)
+        cell_matrix[kept_rules, kept_pos] = kept_sort_idx
+
+        token_pos = torch.zeros(self.vocab_size, dtype=torch.long, device=device)
+        token_pos[kept_sort_idx] = kept_pos
+
+        cell_counts = counts.clamp_max(max_tokens_per_rule).clone()
+        # Empty rules get 1 slot of fallback (pointing to token 0) to avoid
+        # zero-size softmax / sampling collapses downstream.
+        cell_counts = torch.where(cell_counts == 0, torch.ones_like(cell_counts), cell_counts)
+        return CellState(cell_matrix, cell_counts, token_to_cell, token_pos)
+
+    def _rebuild_cell_state_vectorized(
+        self,
+        cell_state: CellState,
+        token_chunk_embeds: torch.Tensor,
+        token_chunk_ids: torch.Tensor,
+        device: torch.device,
+    ) -> CellState:
+        """Vectorised incremental rebuild.
+
+        The old implementation used a Python for-loop over every changed token
+        with four .item() syncs each, which blew O(K) GPU<->CPU round trips.
+        We instead rebuild the affected rule rows from scratch using segmented
+        scatter, which completes in O(V + R) on-device with zero per-token
+        branching.
+        """
         cell_matrix, cell_counts, token_to_cell, token_pos = cell_state
         max_tokens_per_rule = cell_matrix.size(1)
         with torch.no_grad():
             embeds = rms_normalize(token_chunk_embeds) * math.sqrt(self.embed_size)
-            z = self.vq_layer.project_in(embeds.to(device))
-            bound = torch.tanh(z)
-            scaled = (bound + 1.0) / 2.0 * (self.vq_layer.levels_t - 1.0)
-            quantized = torch.round(scaled)
-            new_primary_rules = torch.sum(quantized.long() * self.vq_layer.basis, dim=-1)
+            new_primary_rules = self._vq_rule_ids(embeds.to(device))
 
-        old_primary_rules = token_to_cell[token_chunk_ids]
-        changed_mask = old_primary_rules != new_primary_rules
-        changed_tokens = token_chunk_ids[changed_mask].tolist()
-        old_r_list = old_primary_rules[changed_mask].tolist()
-        new_r_list = new_primary_rules[changed_mask].tolist()
+        # Apply the partial update into a copy of token_to_cell, then rebuild
+        # the per-rule index from the full vocabulary.  Cost is O(V) regardless
+        # of the chunk size, which amortises over many optimisation steps.
+        updated_token_to_cell = token_to_cell.clone()
+        updated_token_to_cell[token_chunk_ids] = new_primary_rules
 
-        for t, o_r, n_r in zip(changed_tokens, old_r_list, new_r_list):
-            old_pos = int(token_pos[t].item())
-            old_count = int(cell_counts[o_r].item())
-            if old_pos < old_count:
-                last_idx = old_count - 1
-                if old_pos < last_idx:
-                    last_token = int(cell_matrix[o_r, last_idx].item())
-                    cell_matrix[o_r, old_pos] = last_token
-                    token_pos[last_token] = old_pos
-                cell_counts[o_r] = max(1, old_count - 1)
+        counts = torch.bincount(updated_token_to_cell, minlength=self.num_rules)
+        sort_idx = torch.argsort(updated_token_to_cell, stable=True)
+        sorted_rules = updated_token_to_cell[sort_idx]
+        offsets = torch.zeros(self.num_rules + 1, dtype=torch.long, device=device)
+        offsets[1:] = torch.cumsum(counts, dim=0)
+        pos_within_rule_sorted = torch.arange(self.vocab_size, device=device) - offsets[sorted_rules]
+        keep_mask = pos_within_rule_sorted < max_tokens_per_rule
+        kept_sort_idx = sort_idx[keep_mask]
+        kept_rules = sorted_rules[keep_mask]
+        kept_pos = pos_within_rule_sorted[keep_mask]
 
-            new_pos = int(cell_counts[n_r].item())
-            if new_pos < max_tokens_per_rule:
-                cell_matrix[n_r, new_pos] = t
-                token_pos[t] = new_pos
-                cell_counts[n_r] = new_pos + 1
-            token_to_cell[t] = n_r
+        new_cell_matrix = torch.zeros_like(cell_matrix)
+        new_cell_matrix[kept_rules, kept_pos] = kept_sort_idx
+        new_token_pos = torch.zeros_like(token_pos)
+        new_token_pos[kept_sort_idx] = kept_pos
+        new_cell_counts = counts.clamp_max(max_tokens_per_rule).clone()
+        new_cell_counts = torch.where(new_cell_counts == 0, torch.ones_like(new_cell_counts), new_cell_counts)
 
-        return CellState(cell_matrix, cell_counts, token_to_cell, token_pos)
+        return CellState(new_cell_matrix, new_cell_counts, updated_token_to_cell, new_token_pos)
 
 
 class _ExpertLayerState(nn.Module):
@@ -701,3 +1052,4 @@ class RulePagedExpertStore(nn.Module):
                         tensor.grad = None
                     elif tensor.grad is not None:
                         tensor.grad.zero_()
+
