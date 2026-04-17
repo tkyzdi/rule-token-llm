@@ -14,6 +14,7 @@ from tokenizer_utils import (
     normalize_schema_messages,
     resolve_project_path,
     resolve_protocol_tokens,
+    sanitize_training_text,
     sliding_window_chunks,
     validate_sequence,
 )
@@ -60,15 +61,6 @@ def auxiliary_segment_pair(protocol_tokens):
             protocol_tokens["segments"][("__auxiliary__", "open")],
             protocol_tokens["segments"][("__auxiliary__", "close")]
         )
-    if not protocol_tokens["segment_slots"]:
-        return None
-    ranked_slots = sorted(
-        protocol_tokens["segment_slots"].items(),
-        key=lambda item: -sum(part.get("count", 0) for part in item[1].values())
-    )
-    for _, slot_parts in ranked_slots:
-        if "open" in slot_parts and "close" in slot_parts:
-            return slot_parts["open"], slot_parts["close"]
     return None
 
 
@@ -81,9 +73,13 @@ def _make_sft_extractor(schema):
         messages = normalize_schema_messages(data, schema)
         parts = []
         for msg in messages:
-            parts.append(msg.get("content", ""))
+            cleaned_content = sanitize_training_text(msg.get("content", ""))
+            if cleaned_content:
+                parts.append(cleaned_content)
             if msg.get("auxiliary_content", ""):
-                parts.append(msg["auxiliary_content"])
+                cleaned_aux = sanitize_training_text(msg["auxiliary_content"])
+                if cleaned_aux:
+                    parts.append(cleaned_aux)
         joined = "\n".join(parts)
         return joined if joined.strip() else None
     return extract_fn
@@ -145,13 +141,14 @@ def main():
             aux_pair = auxiliary_segment_pair(protocol_tokens)
             for message_index, message in enumerate(messages):
                 role = message.get("role", "")
-                content = inject_protocol_segments(message.get("content", ""), protocol_tokens)
+                content = sanitize_training_text(message.get("content", ""))
+                content = inject_protocol_segments(content, protocol_tokens)
                 role_token = role_slot_for_message(role, message_index, len(messages), protocol_tokens)
                 if role_token is not None:
                     sequence.append(role_token["id"])
                 token_ids = enc.encode(content, allowed_special="all")
                 sequence.extend(token_ids)
-                auxiliary_content = message.get("auxiliary_content", "")
+                auxiliary_content = sanitize_training_text(message.get("auxiliary_content", ""))
                 if auxiliary_content and aux_pair is not None:
                     aux_open, aux_close = aux_pair
                     sequence.append(aux_open["id"])
