@@ -2,91 +2,162 @@
 
 [English](README_EN.md) | [简体中文](README.md)
 
-本项目是一个基于从零构建的创新型大语言模型（LLM）训练与推理框架。摒弃了传统 Transformer 的部分低效设计，引入了 **Rule Token（规则令牌）**、**非欧几何球面注意力（Non-Euclidean Spherical Attention）** 以及 **自适应混合专家系统（Adaptive MoE）**，旨在探索更高效、更具解释性的高维语义空间建模方式。
+本项目是一个从零实现的规则驱动语言模型训练与推理框架。它不是标准的“词表 softmax + 常规 Transformer”实现，而是围绕 **Rule Token 分层生成**、**规则感知注意力/投影**、**分页式专家存储** 与 **数据集绑定词表** 展开，目标是在同一套代码中打通数据构建、训练、推理与本地评测。
+
 
 ---
 
-## 🌟 核心创新特性
+## 核心能力
 
-1. **Rule Token Causal Model (内生规则区域因果模型)**
-   - 彻底重构了 Token 映射机制，采用**内生规则区域范式 (Endogenous Rule-Region Paradigm)**，将高维词表空间划分为基于高斯分布的“规则流形”。
-   - 推理成为两步层级计算：1. 宏观路由定位规则区域；2. 微观坍缩定位具体 Token。摒弃外部硬编码映射，拥抱连续空间内的引力路由。
-   - **完全连续自回归生成 (Continuous Auto-Regressive Generation)**：模型具备自主预测 `<EOS>` 终止的能力，彻底消除硬编码长度限制和人为标点符号干预。
+1. **Rule Token 分层生成**
+   - `RuleTokenCausalModel` 先预测规则分布，再在该规则对应的候选 Token 集合内完成局部读出。
+   - 规则划分由 `FiniteScalarQuantizer` 与 `compute_rule_vocab_mask()` 在词嵌入空间上建立，不是固定人工表。
+   - 推理时会优先在已训练过的活跃 Token 上采样，并支持预测 `<EOS>` 结束；同时仍保留 `max_new_tokens` 上限，避免无界生成。
 
-2. **Non-Euclidean Spherical Attention & Top-Down Masking (非欧球面注意力与自顶向下掩码)**
-   - 废弃了传统无界的点乘注意力（Dot-product Attention），采用 L2 超球面上的余弦引力（Cosine Gravity）。真理是方向性的，而非数值大小。
-   - **自顶向下的注意力掩码 (Top-Down Attention Masking)**：由规则本身决定注意力拓扑结构，强制实现稀疏且结构相关的注意力，屏蔽高维噪声，显著提升梯度保真度。
+2. **规则感知注意力与投影**
+   - `RuleAwareProjection` 为 Q/K/V/O 投影提供按规则条件化的 Kronecker 适配器。
+   - 注意力主体仍使用 PyTorch 的 causal SDPA，但会叠加基于规则相似度的可微 bias，而不是硬性的离散 mask。
+   - 额外实现了分层 rule-level attention，对前缀中各规则的聚合状态做因果汇总。
 
-3. **RulePagedExpertStore (基于规则的分页专家存储 MoE)**
-   - 动态计算 Rule 的使用频率，自动加载和卸载专家网络（Expert FFNs），实现极细粒度的计算资源调度。
-   - 在不增加显存压力的前提下，显著提升模型参数容量。
+3. **分页式 Rule MoE**
+   - `RulePagedExpertStore` 将专家参数常驻 CPU，需要时按活跃规则分页搬运到运行设备。
+   - 训练与推理都会基于当前活跃规则构建 runtime pages，并按使用能量进行缓存/淘汰。
+   - 这套机制的目标是降低显存压力，而不是宣称“无代价扩容”。
 
-4. **Fully Intelligent Driven Architecture (完全智能驱动的自适应架构)**
-   - 基于高维几何容量（$\sqrt{embed\_size}$）与当前信息熵，**智能动态调整负样本数量**（Dynamic Negative Sampling）与温度系数。
-   - 根据梯度范数和信息熵动态调整学习率和规则数量，内置 Log-space EMA 梯度追踪器，防止训练过程中的“死亡螺旋”。
+4. **自适应训练流程**
+   - 训练脚本会根据词表规模、序列长度与设备容量自动推断模型初始配置、批大小、梯度累积和训练窗口。
+   - 训练中实现了动态负样本采样、梯度 Log-space EMA 跟踪、学习率阻尼、梯度裁剪，以及规则数自适应收缩。
+   - 当规则数收缩时，使用基于 Sinkhorn 最优传输的参数合并，而不是简单的硬匹配平均。
+
+5. **数据集绑定词表与协议符号**
+   - `tokenizer_utils.py` 会从项目目录下自动发现 JSONL 数据，推断记录结构、对话角色、辅助段落与协议符号。
+   - `expand_sft_vocab.py` 实际作用是构建或刷新 `distilled_vocab.json`，并不是只针对 SFT 扩词。
+   - `build_real_dataset.py` 与 `build_sft_dataset.py` 都依赖这套词表与协议信息来生成训练分块。
+
+6. **本地评测链路**
+   - `evaluate_local_benchmark.py` 可以从本地 JSONL 构建 benchmark，执行推理，并输出按任务/领域切分的评测报告。
+   - 这是仓库当前真实存在的脚本能力，原 README 未覆盖。
 
 ---
 
-## 📁 项目结构
+## 项目结构
 
 ```text
-📦 开源大模型
- ┣ 📜 build_real_dataset.py      # 构建预训练语料数据集脚本
- ┣ 📜 build_sft_dataset.py       # 构建指令微调 (SFT) 数据集脚本
- ┣ 📜 expand_sft_vocab.py        # 针对 SFT 数据扩展词表工具
- ┣ 📜 large_scale_trainer.py     # 大规模分布式训练核心脚本 (含自适应状态管理)
- ┣ 📜 large_scale_inference.py   # 大模型推理引擎 (支持交互式与批量推理)
- ┣ 📜 rule_token_engine.py       # 核心模型架构 (Attention, FSQ, MoE 专家网络)
- ┣ 📜 tokenizer_utils.py         # 词表管理、切词与张量运算工具库
+📦 rule-token-llm
+ ┣ 📜 build_real_dataset.py       # 从本地 JSONL 构建无监督预训练分块
+ ┣ 📜 build_sft_dataset.py        # 从本地 JSONL 构建 SFT 分块（含角色/协议符号）
+ ┣ 📜 expand_sft_vocab.py         # 构建或刷新数据集绑定词表 distilled_vocab.json
+ ┣ 📜 large_scale_trainer.py      # 训练入口：自适应调度、规则收缩、检查点保存
+ ┣ 📜 large_scale_inference.py    # 推理入口：交互式推理或基于数据分块的批量回放
+ ┣ 📜 evaluate_local_benchmark.py # 本地 benchmark 构建与评测
+ ┣ 📜 rule_token_engine.py        # 核心模型：Rule Attention、FSQ、HRR、Paged Expert
+ ┣ 📜 tokenizer_utils.py          # 数据结构推断、词表构建、协议符号与 tokenizer 工具
 ```
 
 ---
 
-## 🚀 快速开始
+## 快速开始
 
 ### 1. 环境准备
-建议使用 Python 3.8+ 及 PyTorch 2.0+ 环境。安装必要的依赖：
+
+建议使用 Python 3.8+ 与 PyTorch 2.x：
+
 ```bash
 pip install torch tiktoken
 ```
 
-### 2. 数据准备
-首先，你需要从原始文本库中构建用于训练的张量数据集分块：
-```bash
-# 构建预训练数据集
-python build_real_dataset.py
+### 2. 放置数据
 
-# 构建 SFT 指令微调数据集
+将训练用 `.jsonl` 数据放在项目根目录。脚本会自动选择根目录下匹配到的本地数据文件，并据此推断：
+
+- 词表与协议符号
+- 记录 schema / message schema
+- 预训练与 SFT 的序列长度和分块预算
+
+如果你想显式先构建词表，可执行：
+
+```bash
+python expand_sft_vocab.py
+```
+
+### 3. 构建训练分块
+
+```bash
+python build_real_dataset.py
 python build_sft_dataset.py
 ```
-*(脚本会自动生成 `real_dataset_chunk_*.pt` 和 `sft_dataset_chunk_*.pt`)*
 
-### 3. 模型训练
-运行大规模训练脚本，引擎会自动检测 GPU 环境并启动 `torch.compile` 编译加速：
+脚本会在项目目录生成：
+
+- `real_dataset_chunk_*.pt`
+- `sft_dataset_chunk_*.pt`
+
+### 4. 模型训练
+
 ```bash
 python large_scale_trainer.py
 ```
-训练过程中会自动应用 `GradientTracker` 防止梯度爆炸，并动态调整 Rule 的路由分布。
 
-### 4. 模型推理
-训练完成后，或加载已有权重进行推理。支持终端交互式对话：
+说明：
+
+- 若存在已有 `.pth` 检查点，会自动尝试恢复模型、专家存储与优化器状态。
+- 若当前环境支持 `torch.compile`，训练脚本会自动启用；否则回退到 eager 模式。
+- 训练会按是否存在 `real_dataset_chunk_*.pt` / `sft_dataset_chunk_*.pt` 自动决定阶段顺序。
+
+### 5. 模型推理
+
+交互式推理：
+
 ```bash
 python large_scale_inference.py --interactive
 ```
-*在提示符下输入文本，模型将基于非欧球面引力场进行自回归 Token 生成。*
+
+非交互模式下，脚本会从已有数据分块中抽取若干前缀语境进行批量回放：
+
+```bash
+python large_scale_inference.py
+```
+
+### 6. 本地评测
+
+```bash
+python evaluate_local_benchmark.py --dataset your_eval.jsonl --split test
+```
+
+该脚本会生成 benchmark、预测结果与汇总报告 JSON 文件。
 
 ---
 
-## 🧠 架构解析 (First Principles)
+## 架构说明
 
-### 为什么使用 Spherical Attention？
-在传统 Transformer 中，高维向量的点乘容易导致极值主导 softmax 分布，掩盖了长尾的语义关联。本模型将 Query 和 Key 投影至 L2 超球面，并通过动态温度系数（$\tau = 1 / \log(\text{rank})$）调节。这种设计保证了“方向即语义”，极大提升了模型对罕见词和复杂语境的鲁棒性。
+### 1. 规则是如何得到的？
 
-### Rule-Aware Projection
-在线性层计算中，采用 `RuleAwareProjection`。所有的 Projection 和 Expert FFN 共享相同的 `rule_ids`，通过预计算 `RuleSortContext` 消除 $O(N \log N)$ 的冗余计算，将按 Rule 路由的计算效率提升至极致。
+- 模型不直接把“规则”写死在词表映射里。
+- `FiniteScalarQuantizer` 会把嵌入投影到有限离散坐标系，再得到 `rule_id`。
+- `compute_rule_vocab_mask()` 再把整个词表映射为 `token -> rule` 与 `rule -> candidate tokens`。
+
+
+### 2. 注意力到底做了什么？
+
+- 代码并没有实现“硬 top-down mask 决定一切”的版本。
+- 实际实现是：标准因果注意力 + 规则相似度 bias + rule-level 前缀汇总路径。
+- 这意味着规则信息会改变注意力分布，但不会把注意力退化为完全手工指定的拓扑。
+
+### 3. 为什么需要分页专家？
+
+- 每条序列不会同时激活全部规则。
+- 因此把所有专家常驻 GPU 并不经济。
+- `RulePagedExpertStore` 只把当前活跃规则的专家页搬到设备端，训练后再把梯度散回 CPU 主存中的专家参数。
+
+### 4. Truth Field 是什么？
+
+- 模型最终输出两部分：规则 logits 与 `truth_field_state`。
+- `truth_field_state` 由线性语义场和 `HolographicRuleBinding` 叠加组成。
+- 推理时，模型在选中的规则候选 Token 集上计算与该 field 的相似度，再完成最终采样。
 
 ---
 
-## 📄 开源协议
+
+## 开源协议
 
 本项目采用 **Apache License 2.0** 协议开源。
